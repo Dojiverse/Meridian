@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meridian</title>
+
+<!--
+  ============================================================
+  WHY THIS IS ONE FILE AND NOT A REACT APP
+  ============================================================
+
+  The build plan says React + Vite + TypeScript, and for a production
+  advisor desktop that is the right answer.
+
+  It is the wrong answer here, for two reasons. This project exists to
+  demonstrate that the ENGINE is correct — the interface is a window
+  onto it, and a component tree plus a build config would add a second
+  toolchain without demonstrating anything the engine does not already.
+  And this code is meant to be READ: one commented file is far easier
+  to follow than fifteen across a src/ tree.
+
+  Swapping this for React later is a change to the presentation layer
+  against exactly the same API.
+
+  ============================================================
+  THE ONE THING THIS FILE MUST GET RIGHT
+  ============================================================
+
+  Never call Number() on money.
+
+  Every monetary value arrives as a STRING because JSON numbers become
+  IEEE-754 doubles the moment JavaScript parses them. Turning
+  "1234567890123.45" into a Number here would undo, in the browser,
+  the exactness the entire server was built to preserve.
+
+  So: money is displayed from the *_display fields the server already
+  formatted, or from the raw string. It is never parsed, never summed,
+  never rounded on this side. The only Number() calls below are on
+  counts and array lengths.
+-->
+
+<style>
+  :root {
+    --bg: #fbfcfb; --panel: #fff; --ink: #14201b; --muted: #56685f;
+    --rule: #d2ddd6; --accent: #1b6b49; --warn: #8a5709; --crit: #a32c1e;
+    --warn-bg: #f7edda; --crit-bg: #f8e5e1; --ok-bg: #dceBe2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1411; --panel: #151e1a; --ink: #e3eae5; --muted: #9aaca2;
+      --rule: #253229; --accent: #55c08c; --warn: #d8a44a; --crit: #e37a6a;
+      --warn-bg: #2c2413; --crit-bg: #331b18; --ok-bg: #163023;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    border-bottom: 2px solid var(--ink); padding: 18px 24px;
+    display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+  }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -.02em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px; }
+  section { margin-bottom: 32px; }
+  h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .12em;
+    color: var(--muted); margin: 0 0 12px; font-weight: 600;
+  }
+  .panel {
+    background: var(--panel); border: 1px solid var(--rule);
+    padding: 16px 18px;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th {
+    text-align: left; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .07em; color: var(--muted); font-weight: 600;
+    padding: 6px 10px; border-bottom: 1px solid var(--rule);
+  }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--rule); }
+  td.num, th.num {
+    text-align: right; font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  tr:last-child td { border-bottom: 0; }
+  .over { color: var(--crit); } .under { color: var(--accent); }
+  .pill {
+    display: inline-block; font-size: 11px; padding: 2px 8px;
+    border-radius: 10px; font-weight: 600; letter-spacing: .04em;
+  }
+  .pill.breach { background: var(--crit-bg); color: var(--crit); }
+  .pill.ok { background: var(--ok-bg); color: var(--accent); }
+  .pill.warn { background: var(--warn-bg); color: var(--warn); }
+  .msg { border-left: 3px solid; padding: 10px 14px; margin-bottom: 8px; font-size: 13px; }
+  .msg.block { border-color: var(--crit); background: var(--crit-bg); }
+  .msg.warn { border-color: var(--warn); background: var(--warn-bg); }
+  .msg .who { font-weight: 600; }
+  .msg .auth { color: var(--muted); font-size: 11px; }
+  button {
+    font: inherit; font-weight: 600; padding: 8px 16px; cursor: pointer;
+    border: 1px solid var(--accent); background: var(--accent);
+    color: var(--bg); border-radius: 3px;
+  }
+  button.ghost { background: transparent; color: var(--ink); border-color: var(--rule); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  select, input {
+    font: inherit; padding: 7px 10px; border: 1px solid var(--rule);
+    background: var(--panel); color: var(--ink); border-radius: 3px;
+  }
+  .chain {
+    font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+    color: var(--muted); word-break: break-all;
+  }
+  .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
+  .buy { color: var(--accent); font-weight: 600; }
+  .sell { color: var(--crit); font-weight: 600; }
+  .struck { opacity: .5; text-decoration: line-through; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Meridian</h1>
+  <span class="sub">tax-aware rebalancing &middot; every amount on the wire is a string</span>
+</header>
+
+<main>
+  <section>
+    <div class="row">
+      <select id="account"></select>
+      <button id="propose">Generate proposal</button>
+      <span id="status" class="sub"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Drift</h2>
+    <div class="panel"><div id="drift"></div></div>
+  </section>
+
+  <section>
+    <h2>Positions</h2>
+    <div class="panel"><div id="positions"></div></div>
+  </section>
+
+  <section>
+    <h2>Proposal</h2>
+    <div class="panel"><div id="proposal"><p class="empty">No proposal yet.</p></div></div>
+  </section>
+
+  <section>
+    <h2>Audit trail</h2>
+    <div class="panel"><div id="audit"></div></div>
+  </section>
+</main>
+
+<script>
+// ============================================================
+// NO Number() ON MONEY. ANYWHERE.
+// ============================================================
+// Amounts arrive as strings and are rendered as strings. The server
+// already formatted the display variants; this file never parses,
+// sums, or rounds a monetary value.
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, c =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+async function get(path)        { return (await fetch(path)).json(); }
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.detail || "request failed");
+  return data;
+}
+
+// A weight arrives as a decimal string like "0.166667". Rendering it
+// as a percentage is the ONE place this file parses a number at all —
+// and a weight is a RATIO, not money. That is the same boundary the
+// engine draws internally: Decimal for anything on a statement, float
+// for anything that is an estimate or a display artefact.
+//
+// Everything else, including the sign of a drift, comes from the
+// server's own formatting. Re-deriving a value the server already
+// formatted is how two parts of a system start disagreeing.
+const pct = (w) => (parseFloat(w) * 100).toFixed(1) + "%";
+
+let currentAccount = null;
+
+// ---- drift --------------------------------------------------
+
+function renderDrift(d) {
+  const rows = d.sleeves.map(s => `
+    <tr>
+      <td>${esc(s.sleeve)}${s.in_model ? "" : ' <span class="sub">(untargeted)</span>'}</td>
+      <td class="num">${esc(s.value_display)}</td>
+      <td class="num">${esc(s.actual_display)}</td>
+      <td class="num">${pct(s.target)}</td>
+      <td class="num ${s.drift_display.startsWith("+") ? "over" : "under"}">${esc(s.drift_display)}</td>
+      <td class="num">&plusmn;${pct(s.band_width)}</td>
+      <td>${s.breached ? '<span class="pill breach">breach</span>' : ""}</td>
+    </tr>`).join("");
+
+  $("drift").innerHTML = `
+    <div class="row" style="margin-bottom:12px">
+      <strong>${esc(d.total_display)}</strong>
+      <span class="sub">${esc(d.model_id)} v${d.model_version}</span>
+      ${d.needs_rebalancing
+        ? '<span class="pill breach">rebalance required</span>'
+        : '<span class="pill ok">within bands</span>'}
+    </div>
+    <table>
+      <thead><tr>
+        <th>Sleeve</th><th class="num">Value</th><th class="num">Actual</th>
+        <th class="num">Target</th><th class="num">Drift</th>
+        <th class="num">Band</th><th></th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+// ---- positions ----------------------------------------------
+
+function renderPositions(p) {
+  const rows = p.positions.map(r => `
+    <tr>
+      <td><strong>${esc(r.ticker)}</strong></td>
+      <td>${esc(r.sleeve)}</td>
+      <td class="num">${esc(r.quantity)}</td>
+      <td class="num">${esc(r.value_display)}</td>
+      <td class="num ${r.unrealized.startsWith("-") ? "over" : "under"}">${esc(r.unrealized)}</td>
+      <td class="num">${r.lots}</td>
+    </tr>`).join("");
+
+  $("positions").innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Ticker</th><th>Sleeve</th><th class="num">Shares</th>
+        <th class="num">Value</th><th class="num">Unrealised</th>
+        <th class="num">Lots</th>
+      </tr></thead>
+      <tbody>${rows}
+        <tr><td colspan="3"><em>cash</em></td>
+            <td class="num">${esc(p.cash_display)}</td><td></td><td></td></tr>
+      </tbody>
+    </table>`;
+}
+
+// ---- proposal -----------------------------------------------
+
+function tradeRow(t) {
+  return `<tr class="${t.blocked ? "struck" : ""}">
+    <td class="${t.side}">${t.side.toUpperCase()}</td>
+    <td><strong>${esc(t.ticker)}</strong></td>
+    <td class="num">${esc(t.quantity)}</td>
+    <td class="num">${esc(t.price)}</td>
+    <td class="num">${esc(t.consideration_display)}</td>
+    <td class="sub">${esc(t.reason)}</td>
+  </tr>`;
+}
+
+function renderProposal(p) {
+  const trades = [...p.trades, ...p.blocked];
+
+  const violations = p.violations.map(v => `
+    <div class="msg ${v.severity}">
+      <span class="who">${v.severity.toUpperCase()} ${esc(v.subject)}</span> &mdash;
+      ${esc(v.message)}
+      ${v.authority ? `<div class="auth">${esc(v.authority)}</div>` : ""}
+    </div>`).join("");
+
+  const unplaced = p.unplaced.map(u => `
+    <div class="msg warn">
+      <span class="who">${esc(u.sleeve)}</span> &mdash;
+      ${esc(u.shortfall_display)} not placed: ${esc(u.reason)}
+    </div>`).join("");
+
+  const decided = p.status !== "pending";
+
+  $("proposal").innerHTML = `
+    <div class="row" style="margin-bottom:14px">
+      <strong>${esc(p.proposal_id)}</strong>
+      <span class="pill ${p.status === "approved" ? "ok" : p.status === "rejected" ? "breach" : "warn"}">
+        ${esc(p.status)}</span>
+      <span class="sub">turnover ${esc(p.turnover_display)}
+        &middot; cash after ${esc(p.cash_after_display)}</span>
+    </div>
+
+    ${trades.length ? `<table>
+      <thead><tr>
+        <th></th><th>Ticker</th><th class="num">Shares</th>
+        <th class="num">Price</th><th class="num">Value</th><th>Reason</th>
+      </tr></thead>
+      <tbody>${trades.map(tradeRow).join("")}</tbody>
+    </table>` : '<p class="empty">No trades required.</p>'}
+
+    ${violations ? `<div style="margin-top:16px">${violations}</div>` : ""}
+    ${unplaced ? `<div style="margin-top:8px">${unplaced}</div>` : ""}
+
+    <div class="row" style="margin-top:16px">
+      <input id="actor" placeholder="your name" value="a.advisor">
+      <button id="approve" ${decided || !p.is_clear ? "disabled" : ""}>Approve</button>
+      <button id="reject" class="ghost" ${decided ? "disabled" : ""}>Reject</button>
+      ${!p.is_clear
+        ? '<span class="sub">Approval is disabled while blocking violations stand.</span>'
+        : ""}
+    </div>`;
+
+  if (!decided) {
+    $("approve").onclick = () => decide(p.proposal_id, "approve");
+    $("reject").onclick  = () => decide(p.proposal_id, "reject");
+  }
+}
+
+async function decide(id, what) {
+  const actor = $("actor").value.trim();
+  if (!actor) { alert("Who is approving? An approval that cannot name who gave it is not an approval."); return; }
+  try {
+    const body = what === "approve"
+      ? { actor, note: "reviewed in the blotter" }
+      : { actor, reason: "not proceeding today" };
+    renderProposal(await post(`/api/proposals/${id}/${what}`, body));
+    await refreshAudit();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+// ---- audit --------------------------------------------------
+
+async function refreshAudit() {
+  const a = await get("/api/audit");
+  const rows = a.entries.slice().reverse().map(e => `
+    <tr>
+      <td class="num">${e.seq}</td>
+      <td class="sub">${esc(e.occurred_at.slice(11, 19))}</td>
+      <td><strong>${esc(e.actor)}</strong></td>
+      <td>${esc(e.action)}</td>
+      <td>${esc(e.subject)}</td>
+      <td class="sub">${esc(Object.entries(e.payload).map(([k, v]) => `${k}=${v}`).join(" "))}</td>
+    </tr>`).join("");
+
+  $("audit").innerHTML = `
+    <div class="row" style="margin-bottom:10px">
+      ${a.is_intact
+        ? '<span class="pill ok">chain intact</span>'
+        : '<span class="pill breach">CHAIN BROKEN</span>'}
+      <span class="chain">head ${esc(a.head.slice(0, 32))}&hellip;</span>
+    </div>
+    ${a.breaks.map(b => `<div class="msg block">${esc(b)}</div>`).join("")}
+    ${a.entries.length ? `<table>
+      <thead><tr>
+        <th class="num">#</th><th>Time</th><th>Actor</th>
+        <th>Action</th><th>Subject</th><th>Detail</th>
+      </tr></thead><tbody>${rows}</tbody></table>`
+      : '<p class="empty">Nothing recorded yet.</p>'}`;
+}
+
+// ---- wiring -------------------------------------------------
+
+async function loadAccount(id) {
+  currentAccount = id;
+  $("status").textContent = "";
+  $("proposal").innerHTML = '<p class="empty">No proposal yet.</p>';
+  renderDrift(await get(`/api/accounts/${id}/drift`));
+  renderPositions(await get(`/api/accounts/${id}/positions`));
+  await refreshAudit();
+}
+
+$("propose").onclick = async () => {
+  $("status").textContent = "generating…";
+  try {
+    renderProposal(await post(`/api/accounts/${currentAccount}/proposals`));
+    $("status").textContent = "";
+    await refreshAudit();
+  } catch (e) {
+    $("status").textContent = e.message;
+  }
+};
+
+(async function start() {
+  const accounts = await get("/api/accounts");
+  $("account").innerHTML = accounts.map(a =>
+    `<option value="${esc(a.account_id)}">${esc(a.account_id)} — ${esc(a.account_type)}</option>`
+  ).join("");
+  $("account").onchange = (e) => loadAccount(e.target.value);
+  await loadAccount(accounts[0].account_id);
+})();
+</script>
+</body>
+</html>

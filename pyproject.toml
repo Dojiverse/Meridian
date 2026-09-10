@@ -1,0 +1,86 @@
+[project]
+name = "meridian"
+version = "0.1.0"
+description = "A tax-aware rebalancing, tax-lot, and performance engine"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+# The calculation core has NO runtime dependencies — that is deliberate.
+# Everything below is for the layers around it.
+api = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
+dev = [
+    "meridian[api]",
+    "pytest>=8.0",
+    "hypothesis>=6.100",
+    "mypy>=1.10",
+    "ruff>=0.5",
+    "httpx>=0.27",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# PEP 561 marker. Without this file shipped in the package, anything
+# that imports `meridian` gets NO type checking — mypy treats the whole
+# module as untyped and every Money/Shares confusion sails through. The
+# annotations only help inside this repo unless the marker ships too.
+[tool.setuptools.package-data]
+meridian = ["py.typed", "api/static/*.html"]
+
+
+# ---------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# OneDrive locks the .pytest_cache directory mid-write, which produces a
+# PytestCacheWarning on every run. The cache only speeds up --last-failed,
+# so disabling it costs nothing here.
+addopts = "-v -p no:cacheprovider"
+
+
+# ---------------------------------------------------------------
+# mypy — strict, because the whole point of the Money type is that
+# the type checker catches unit confusion before anything runs.
+# ---------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+# Decimal arithmetic is exact; float is not. Flag any accidental
+# float creeping into a money path.
+disallow_any_explicit = false
+warn_unreachable = true
+
+
+# ---------------------------------------------------------------
+# ruff — linting + formatting
+# ---------------------------------------------------------------
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # import sorting
+    "N",    # pep8 naming
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "RUF",  # ruff-specific
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Property tests read better without forced naming conventions.
+"tests/*" = ["N802"]

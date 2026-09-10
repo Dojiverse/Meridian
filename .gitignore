@@ -1,0 +1,30 @@
+# Secrets. Listed BEFORE the file exists, so there is never a window
+# where an ANTHROPIC_API_KEY could be caught by a `git add .`.
+.env
+.env.*
+!.env.example
+
+# Virtual environment
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
