@@ -609,13 +609,25 @@ def _positions_after(context: ComplianceContext) -> dict[str, Decimal]:
 
 
 def _short_term_gain_of(trade: Trade, context: ComplianceContext) -> Money:
-    """Approximate short-term gain from selling `trade`, FIFO.
+    """Short-term gain from selling `trade`.
 
-    An estimate rather than the exact figure: the lot selection method
-    the trade will actually settle under is decided later. Naming it an
-    estimate matters — a warning that claims precision it does not have
-    invites someone to rely on it for a tax filing.
+    When the order names its lots, the figure is exact: those are the
+    lots that will be disposed of. When it does not — a sell sized
+    without lot data — the gain is ESTIMATED under FIFO, the default the
+    broker applies absent any identification. Naming it an estimate
+    matters: a warning that claims precision it does not have invites
+    someone to rely on it for a tax filing.
     """
+    if trade.lots:
+        return sum(
+            (
+                sel.gain
+                for sel in trade.lots
+                if sel.period is HoldingPeriod.SHORT and not sel.gain.is_negative
+            ),
+            Money.zero(),
+        )
+
     lots = sorted(
         context.lots.get(trade.ticker, ()), key=lambda lot: (lot.acquired, lot.lot_id)
     )
@@ -642,7 +654,14 @@ def _short_term_gain_of(trade: Trade, context: ComplianceContext) -> Money:
 
 
 def _would_realise_loss(trade: Trade, context: ComplianceContext) -> bool:
-    """Whether selling would realise a loss on any lot, FIFO."""
+    """Whether selling would realise a loss on any lot.
+
+    Exact against the named lots; FIFO otherwise, for the same reason as
+    `_short_term_gain_of`.
+    """
+    if trade.lots:
+        return any(sel.gain.is_negative for sel in trade.lots)
+
     lots = sorted(
         context.lots.get(trade.ticker, ()), key=lambda lot: (lot.acquired, lot.lot_id)
     )

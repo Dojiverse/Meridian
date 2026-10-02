@@ -32,6 +32,7 @@ from meridian.household import Account, AccountType
 from meridian.ledger import Buy, Deposit, LedgerEvent
 from meridian.model import BandKind, Model, Sleeve
 from meridian.money import Money, Price, Shares, Weight
+from meridian.taxlot import TaxRates
 from meridian.washsale import SubstituteMap
 
 TODAY = date(2026, 9, 8)
@@ -77,6 +78,14 @@ CONSERVATIVE = Model(
     },
 )
 
+# A high-bracket taxable client: 37% ordinary, 20% long-term, plus the
+# 3.8% NIIT. Supplied, never assumed — the engine refuses to guess a
+# bracket, because a guessed rate produces an authoritative-looking tax
+# figure that is not.
+HIGH_BRACKET = TaxRates(
+    short_term=Weight("0.37"), long_term=Weight("0.20"), niit=Weight("0.038")
+)
+
 # The firm's policy on substantial identity. GLD and IAU both hold
 # physical gold; this firm has decided to treat them as identical. A
 # judgment call, recorded as data.
@@ -108,6 +117,7 @@ def build_demo_store() -> Store:
         classification=CLASSIFICATION,
         events=taxable_events,
         substitutes=SUBSTITUTES,
+        rates=HIGH_BRACKET,
         gate=ComplianceGate(
             constraints=(
                 RestrictedSecurity(

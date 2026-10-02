@@ -37,13 +37,13 @@ visible and so does the fix. On a whiteboard, a correction and a
 cover-up look identical.
 
 ============================================================
-WHAT THIS MODULE DOES NOT DO YET
+WHAT THIS MODULE DOES NOT DO
 ============================================================
 
-Hash chaining, bitemporal columns, and as-of replay arrive in Phase 07
-with the compliance gate. The structural guarantee — events immutable,
-positions derived, nothing edited in place — is here now, because
-everything above it depends on it.
+The events themselves are not hash-chained; that protection lives in
+`audit.py`, which records every decision made ABOUT the ledger. The
+structural guarantee here — events immutable, positions derived,
+nothing edited in place — is what everything above it depends on.
 """
 
 from __future__ import annotations
@@ -128,6 +128,17 @@ class Sell:
     ticker: str
     quantity: Shares
     price: Price
+
+    lot_ids: tuple[str, ...] = ()
+    """Which lots this sale disposes of, in the order they are consumed.
+
+    Empty means no identification was made and the default method
+    applies when lots are rebuilt (FIFO for stock). Populated when the
+    order was sized against specific lots — which is what a tax-aware
+    rebalance does — so that replaying the ledger consumes exactly the
+    lots the trade was built on. Treas. Reg. 1.1012-1(c) makes the
+    identification part of the sale; here it is part of the event.
+    """
 
     @property
     def proceeds(self) -> Money:

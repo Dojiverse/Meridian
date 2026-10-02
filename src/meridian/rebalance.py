@@ -28,12 +28,19 @@ FOUR DECISIONS, EACH WITH A COST
 
 3. WHICH SECURITY WITHIN A SLEEVE. "Buy $12,000 of equity" is not an
    order. The sleeve may hold VTI and AAPL, and something has to decide
-   the split. Here it is proportional to what is already held — and the
-   split runs through the SAME allocate() the money uses everywhere
-   else, so a sleeve's trades sum to the sleeve's delta exactly.
+   the split.
 
-   (Phase 04 replaces this for sells, where tax lots make some shares
-   far more expensive to sell than others.)
+   BUYS top up in proportion to what is already held, through the SAME
+   allocate() the money uses everywhere else, so a sleeve's trades sum
+   to the sleeve's delta exactly.
+
+   SELLS are chosen by TAX LOT when lots are supplied. "Sell $3,000 of
+   equity" becomes "sell the lots whose disposal costs the least tax",
+   ranked across every security in the sleeve by the policy's lot
+   method — min-tax by default. The chosen lots travel on the Trade and
+   into the Sell event, so the ledger replays exactly the disposal the
+   order was sized against. Without lots (a retirement account, where
+   lot choice has no tax consequence) sells fall back to proportional.
 
 4. ROUNDING DIRECTION. Always toward zero, never nearest. A buy rounded
    up orders more than the cash can fund; a sell rounded up sells shares
@@ -56,7 +63,7 @@ tests assert.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -68,8 +75,17 @@ from meridian.drift import DriftReport, SleeveDrift, compute_drift, group_values
 from meridian.ledger import Buy, LedgerEvent, Portfolio, Sell, market_values
 from meridian.model import Model
 from meridian.money import Money, Price, Shares, Weight
+from meridian.taxlot import (
+    HoldingPeriod,
+    LotError,
+    LotMethod,
+    TaxLot,
+    TaxRates,
+    lot_sort_key,
+)
 
 __all__ = [
+    "LotSelection",
     "Proposal",
     "RebalancePolicy",
     "Side",
@@ -127,6 +143,29 @@ class RebalancePolicy:
     """Cash held back from investment — for fees, withdrawals, and
     settlement timing. Never deployed by a rebalance."""
 
+    cash_trigger: Weight | None = None
+    """Act when idle cash exceeds this share of total value, even with
+    every sleeve inside its band.
+
+    Drift is measured over invested value, so a contribution that sits
+    as cash moves no sleeve and trips no band. Without this, a client
+    making quarterly deposits can hold ten percent of the account in
+    cash for a year while every review says "nothing to do" — which is
+    true of the bands and false of the portfolio. Cash drag is a cost
+    too. None disables the trigger; 2% is a common setting.
+    """
+
+    lot_method: LotMethod = LotMethod.MIN_TAX
+    """How sells choose their lots when lots are supplied.
+
+    MIN_TAX ranks every lot in the sleeve by the tax its disposal would
+    cost per dollar raised, so losses go first, then the cheaper rate,
+    then the dearer one. It needs the client's rates and refuses to
+    guess them. HIFO is the usual choice when rates are unknown.
+    SPECIFIC_ID is not a policy — it is the advisor naming lots — and
+    is rejected here.
+    """
+
     band_entry: Decimal = DEFAULT_BAND_ENTRY
     """How far INSIDE the band to land, as a fraction of band width.
 
@@ -153,6 +192,41 @@ class RebalancePolicy:
             raise ValueError("share_increment must be positive")
         if not 0 <= self.band_entry <= 1:
             raise ValueError("band_entry must be a fraction between 0 and 1")
+        if self.lot_method is LotMethod.SPECIFIC_ID:
+            raise ValueError(
+                "SPECIFIC_ID is not a rebalancing policy — it is the advisor "
+                "naming lots. Choose FIFO, LIFO, HIFO, or MIN_TAX."
+            )
+        if self.cash_trigger is not None and not 0 <= self.cash_trigger.value <= 1:
+            raise ValueError("cash_trigger must be a fraction between 0 and 1")
+
+
+@dataclass(frozen=True, slots=True)
+class LotSelection:
+    """One lot a sell order disposes of, and what that realises.
+
+    The identification Treas. Reg. 1.1012-1(c) asks for, recorded at
+    the moment the order is sized rather than reconstructed afterwards.
+    """
+
+    lot_id: str
+    quantity: Shares
+    acquired: date
+    proceeds: Money
+    cost_basis: Money
+    period: HoldingPeriod
+
+    @property
+    def gain(self) -> Money:
+        """Positive is a gain, negative is a loss."""
+        return self.proceeds - self.cost_basis
+
+    def __str__(self) -> str:
+        kind = "loss" if self.gain.is_negative else "gain"
+        return (
+            f"{self.lot_id}: {self.quantity} acquired {self.acquired} "
+            f"({self.period.value}) — {kind} of {abs(self.gain)}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,10 +240,24 @@ class Trade:
     sleeve: str
     reason: str
 
+    lots: tuple[LotSelection, ...] = ()
+    """For a lot-aware sell: which lots, in consumption order. Their
+    quantities sum to `quantity` exactly. Empty for buys and for sells
+    sized without lot data."""
+
     @property
     def consideration(self) -> Money:
         """What it costs (buy) or raises (sell)."""
         return self.quantity.value_at(self.price)
+
+    @property
+    def realized_gain(self) -> Money | None:
+        """What the sale realises across its lots, or None when the
+        order was not sized against lots. None rather than zero: an
+        unknown gain is not a gain of nothing."""
+        if not self.lots:
+            return None
+        return sum((lot.gain for lot in self.lots), Money.zero())
 
     @property
     def cash_effect(self) -> Money:
@@ -221,6 +309,12 @@ class Proposal:
     cash_before: Money
     cash_after: Money
 
+    trigger: str = "none"
+    """Why the engine acted: 'band' when a sleeve left its tolerance,
+    'cash' when idle cash alone exceeded the policy's trigger, 'none'
+    for an empty proposal. Recorded so a review can say not just what
+    was traded but what prompted it."""
+
     @property
     def is_empty(self) -> bool:
         return not self.trades
@@ -251,7 +345,14 @@ class Proposal:
         for trade in (*self.sells, *self.buys):
             if trade.side is Side.SELL:
                 events.append(
-                    Sell(seq, self.on, trade.ticker, trade.quantity, trade.price)
+                    Sell(
+                        seq,
+                        self.on,
+                        trade.ticker,
+                        trade.quantity,
+                        trade.price,
+                        lot_ids=tuple(lot.lot_id for lot in trade.lots),
+                    )
                 )
             else:
                 events.append(
@@ -286,12 +387,27 @@ def generate_proposal(
     *,
     on: date,
     policy: RebalancePolicy | None = None,
+    lots: Mapping[str, Sequence[TaxLot]] | None = None,
+    rates: TaxRates | None = None,
 ) -> Proposal:
     """Produce the trades that bring `portfolio` back toward `model`.
+
+    Args:
+        lots: Open tax lots by ticker, as built from the same ledger as
+            `portfolio`. When given, sells are chosen lot by lot under
+            `policy.lot_method` and each Trade records its lots. Pass
+            None for a tax-advantaged account, where lot choice has no
+            tax consequence and proportional selling is fine.
+        rates: The client's marginal rates. Required by MIN_TAX.
 
     Returns an empty proposal — not an error — when no band is breached.
     "Nothing to do" is a valid and common answer, and a rebalancer that
     trades on every review is a rebalancer that costs its clients money.
+
+    Raises:
+        LotError: if lots are supplied but disagree with the positions
+            they are supposed to describe, or MIN_TAX is asked for
+            without rates.
     """
     policy = policy or RebalancePolicy()
 
@@ -306,7 +422,17 @@ def generate_proposal(
     total_value = portfolio.total_value(prices)
     investable = total_value - policy.cash_buffer
 
-    if not drift.needs_rebalancing:
+    # Two reasons to act. A band breach is the usual one. Idle cash is
+    # the other: it moves no sleeve, so the bands cannot see it, but a
+    # policy may say that too much of it is itself a reason to trade.
+    idle = portfolio.cash - policy.cash_buffer
+    cash_triggered = (
+        policy.cash_trigger is not None
+        and not total_value.is_zero
+        and idle.ratio_to(total_value).value > policy.cash_trigger.value
+    )
+
+    if not drift.needs_rebalancing and not cash_triggered:
         return Proposal(
             on=on,
             model_id=model.model_id,
@@ -319,6 +445,8 @@ def generate_proposal(
             cash_after=portfolio.cash,
         )
 
+    trigger = "band" if drift.needs_rebalancing else "cash"
+
     # ---- what each sleeve should be worth -------------------------
     deltas = _sleeve_deltas(drift, model, investable, policy)
 
@@ -328,7 +456,9 @@ def generate_proposal(
 
     # Sells first: they raise the cash the buys spend.
     for sleeve, delta in sorted(deltas.items()):
-        if delta.is_negative:
+        if not delta.is_negative:
+            continue
+        if lots is None:
             _plan_sells(
                 sleeve,
                 abs(delta),
@@ -336,6 +466,20 @@ def generate_proposal(
                 prices,
                 classification,
                 policy,
+                trades,
+                unplaced,
+            )
+        else:
+            _plan_sells_by_lot(
+                sleeve,
+                abs(delta),
+                portfolio,
+                prices,
+                classification,
+                policy,
+                lots,
+                rates,
+                on,
                 trades,
                 unplaced,
             )
@@ -374,6 +518,7 @@ def generate_proposal(
         unplaced=tuple(unplaced),
         cash_before=portfolio.cash,
         cash_after=cash_after,
+        trigger=trigger,
     )
 
 
@@ -526,7 +671,12 @@ def _plan_sells(
     trades: list[Trade],
     unplaced: list[Unplaced],
 ) -> None:
-    """Raise `amount` from the holdings classified into `sleeve`."""
+    """Raise `amount` from `sleeve`, proportionally to what is held.
+
+    The path for callers WITHOUT lot data — a retirement account, where
+    which lot is sold makes no tax difference. Taxable accounts should
+    supply lots and take `_plan_sells_by_lot` instead.
+    """
     holdings = {
         ticker: quantity
         for ticker, quantity in portfolio.positions.items()
@@ -578,6 +728,154 @@ def _plan_sells(
                 price=price,
                 sleeve=sleeve,
                 reason=f"{sleeve} overweight; raising {target_amount}",
+            )
+        )
+
+    if amount > sleeve_value:
+        _record_unplaced(
+            unplaced,
+            sleeve,
+            amount - sleeve_value,
+            "sleeve does not hold enough to raise the full amount",
+            policy,
+        )
+
+
+def _plan_sells_by_lot(
+    sleeve: str,
+    amount: Money,
+    portfolio: Portfolio,
+    prices: Mapping[str, Price],
+    classification: Mapping[str, str],
+    policy: RebalancePolicy,
+    lots: Mapping[str, Sequence[TaxLot]],
+    rates: TaxRates | None,
+    on: date,
+    trades: list[Trade],
+    unplaced: list[Unplaced],
+) -> None:
+    """Raise `amount` from `sleeve` by selling the cheapest lots first.
+
+    ============================================================
+    WHY THE SLEEVE, NOT THE SECURITY, IS THE UNIT
+    ============================================================
+
+    "Alt is overweight by $3,000" does not say which of the sleeve's
+    holdings to sell, and the tax answer can differ enormously: the
+    same $3,000 raised from a lot bought last month at a loss offsets
+    other gains, while $3,000 from a lot bought in 2019 realises a large
+    long-term gain. So every open lot across every security in the
+    sleeve is ranked together by `lot_sort_key`, per dollar of proceeds,
+    and consumed in that order until the amount is raised.
+
+    Lots taken in full are taken exactly. The final, partial lot is
+    rounded DOWN to the tradeable increment, same as every other order,
+    so the sale can always be made. Each resulting order carries its
+    lots, and `Proposal.to_events` puts their ids on the Sell event so
+    the ledger consumes those lots and no others.
+    """
+    holdings = {
+        ticker: quantity
+        for ticker, quantity in portfolio.positions.items()
+        if classification.get(ticker) == sleeve and not quantity.is_zero
+    }
+
+    if not holdings:
+        _record_unplaced(
+            unplaced,
+            sleeve,
+            amount,
+            "sleeve is overweight but holds nothing to sell",
+            policy,
+        )
+        return
+
+    # Lots and positions are two views of the same ledger. If they
+    # disagree, one of them is wrong, and sizing a sale against the
+    # wrong one produces an order the custodian will reject.
+    sleeve_lots: list[TaxLot] = []
+    for ticker, held in sorted(holdings.items()):
+        ticker_lots = list(lots.get(ticker, ()))
+        in_lots = sum((lot.quantity.quantity for lot in ticker_lots), Decimal(0))
+        if in_lots != held.quantity:
+            raise LotError(
+                f"lots for {ticker} total {Shares(in_lots)} but the position is "
+                f"{held}; lots and positions come from the same ledger and "
+                "must agree"
+            )
+        sleeve_lots.extend(ticker_lots)
+
+    sleeve_value = sum(
+        (q.value_at(prices[t]) for t, q in holdings.items()), Money.zero()
+    )
+    raising = amount if amount <= sleeve_value else sleeve_value
+
+    ranked = sorted(
+        sleeve_lots,
+        key=lambda lot: lot_sort_key(
+            lot, policy.lot_method, on=on, price=prices[lot.ticker], rates=rates
+        ),
+    )
+
+    picks: dict[str, list[LotSelection]] = {}
+    remaining = raising
+
+    for lot in ranked:
+        if remaining <= Money.zero():
+            break
+        price = prices[lot.ticker]
+        lot_value = lot.market_value(price)
+
+        if lot_value <= remaining:
+            take = lot.quantity
+            basis = lot.cost_basis
+        else:
+            take = Shares(remaining.amount / price.amount).round_to(
+                policy.share_increment
+            )
+            if take.is_zero:
+                # Less than one tradeable increment left to raise. The
+                # residue stays as cash, as it does for every order.
+                break
+            sold, _ = lot.split(take)
+            basis = sold.cost_basis
+
+        picks.setdefault(lot.ticker, []).append(
+            LotSelection(
+                lot_id=lot.lot_id,
+                quantity=take,
+                acquired=lot.acquired,
+                proceeds=take.value_at(price),
+                cost_basis=basis,
+                period=lot.period_at(on),
+            )
+        )
+        remaining = remaining - take.value_at(price)
+
+    for ticker in sorted(picks):
+        selections = tuple(picks[ticker])
+        quantity = sum((s.quantity for s in selections), Shares.zero())
+        price = prices[ticker]
+        consideration = quantity.value_at(price)
+        if consideration < policy.min_trade:
+            # Not worth an order. The lots stay where they are.
+            continue
+
+        realised = sum((s.gain for s in selections), Money.zero())
+        kind = "loss" if realised.is_negative else "gain"
+        trades.append(
+            Trade(
+                ticker=ticker,
+                side=Side.SELL,
+                quantity=quantity,
+                price=price,
+                sleeve=sleeve,
+                reason=(
+                    f"{sleeve} overweight; {len(selections)} lot(s) chosen by "
+                    f"{policy.lot_method.value}, realising a {kind} of "
+                    f"{abs(realised)}"
+                ),
+                lots=selections,
             )
         )
 

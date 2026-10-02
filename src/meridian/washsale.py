@@ -542,16 +542,29 @@ class HarvestOpportunity:
 
     @property
     def block_reason(self) -> str:
+        """Why the harvest cannot be taken, naming the worst blocker.
+
+        Worst, not first. When several purchases fall inside the window
+        the outcome is decided by the most damaging one: a single
+        replacement inside an IRA forfeits the loss no matter how many
+        taxable purchases also sit in the window. Reporting the earliest
+        purchase instead would describe a deferral the client is not
+        going to get.
+        """
         if not self.blocked_by:
             return ""
-        first = self.blocked_by[0]
-        if first.account_type.forfeits_wash_sale_basis:
+        forfeiting = [
+            a for a in self.blocked_by if a.account_type.forfeits_wash_sale_basis
+        ]
+        if forfeiting:
+            worst = forfeiting[0]
             return (
-                f"would be washed by the {first.on} purchase in "
-                f"{first.account_id} — and because that is a retirement "
+                f"would be washed by the {worst.on} purchase in "
+                f"{worst.account_id} — and because that is a retirement "
                 "account, the loss would be PERMANENTLY FORFEITED "
                 "(Rev. Rul. 2008-5), not deferred"
             )
+        first = self.blocked_by[0]
         return (
             f"would be washed by the {first.on} purchase in {first.account_id}; "
             "the loss would be deferred into that lot's basis"

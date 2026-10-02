@@ -53,7 +53,8 @@ from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
 from meridian.compliance import ComplianceResult, Severity, Violation
 from meridian.drift import DriftReport, SleeveDrift
 from meridian.money import Money, Price, Shares, Weight
-from meridian.rebalance import Proposal, Side, Trade, Unplaced
+from meridian.rebalance import LotSelection, Proposal, Side, Trade, Unplaced
+from meridian.taxlot import HoldingPeriod
 
 # ============================================================
 # Serialisers
@@ -147,6 +148,32 @@ class DriftOut(Schema):
 # ============================================================
 
 
+class LotSelectionOut(Schema):
+    """One lot a sell disposes of — the specific identification."""
+
+    lot_id: str
+    quantity: SharesStr
+    acquired: date
+    proceeds: MoneyStr
+    cost_basis: MoneyStr
+    gain: MoneyStr
+    gain_display: str
+    period: HoldingPeriod
+
+    @classmethod
+    def of(cls, sel: LotSelection) -> LotSelectionOut:
+        return cls(
+            lot_id=sel.lot_id,
+            quantity=sel.quantity,
+            acquired=sel.acquired,
+            proceeds=sel.proceeds,
+            cost_basis=sel.cost_basis,
+            gain=sel.gain,
+            gain_display=str(sel.gain),
+            period=sel.period,
+        )
+
+
 class TradeOut(Schema):
     ticker: str
     side: Side
@@ -158,8 +185,16 @@ class TradeOut(Schema):
     reason: str
     blocked: bool = False
 
+    lots: tuple[LotSelectionOut, ...] = ()
+    realized_gain: MoneyStr | None = None
+    """What a lot-aware sell realises. Null — not zero — for buys and
+    for sells sized without lot data: an unknown gain is not a gain of
+    nothing."""
+    realized_gain_display: str = ""
+
     @classmethod
     def of(cls, trade: Trade, *, blocked: bool = False) -> TradeOut:
+        gain = trade.realized_gain
         return cls(
             ticker=trade.ticker,
             side=trade.side,
@@ -170,6 +205,9 @@ class TradeOut(Schema):
             sleeve=trade.sleeve,
             reason=trade.reason,
             blocked=blocked,
+            lots=tuple(LotSelectionOut.of(sel) for sel in trade.lots),
+            realized_gain=gain,
+            realized_gain_display="" if gain is None else str(gain),
         )
 
 

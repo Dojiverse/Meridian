@@ -35,6 +35,7 @@ from meridian.rebalance import (
     TargetMode,
     generate_proposal,
 )
+from meridian.taxlot import LotError, LotMethod, TaxRates, build_lots, dispose
 
 D = date(2026, 9, 8)
 
@@ -520,3 +521,323 @@ def test_relative_bands_also_produce_applicable_proposals(
     )
     proposal = generate_proposal(fold(events), PRICES, relative, CLASSIFICATION, on=D)
     fold([*events, *proposal.to_events(1000)])
+
+
+# ============================================================
+# LOT-AWARE SELLS
+# ============================================================
+# The same drill portfolio — 60/25/15 against 55/35/10 — but the
+# equity sleeve's two holdings were bought at different times and
+# prices, so WHICH equity to sell now has a tax answer:
+#
+#   VTI   300 sh bought 2024-01-02 at $100, now $140  -> +$12,000 long
+#   AAPL  100 sh bought 2026-08-01 at $200, now $180  ->  -$2,000 short
+#
+# Market values are unchanged from DRIFTED, so the sleeve deltas are
+# identical. Only the choice of lot differs.
+
+HIGH = TaxRates(
+    short_term=Weight("0.37"), long_term=Weight("0.20"), niit=Weight("0.038")
+)
+
+LOTTED: list[LedgerEvent] = [
+    Deposit(1, date(2024, 1, 2), Money("90000.00")),
+    Buy(2, date(2024, 1, 2), "VTI", Shares("300"), Price("100.00")),  # 30,000
+    Buy(3, date(2024, 1, 2), "BND", Shares("500"), Price("50.00")),  # 25,000
+    Buy(4, date(2024, 1, 2), "GLD", Shares("100"), Price("150.00")),  # 15,000
+    Buy(5, date(2026, 8, 1), "AAPL", Shares("100"), Price("200.00")),  # 20,000
+]
+
+
+def propose_with_lots(
+    events: list[LedgerEvent],
+    policy: RebalancePolicy | None = None,
+    rates: TaxRates | None = HIGH,
+) -> Proposal:
+    return generate_proposal(
+        fold(events),
+        PRICES,
+        MODEL,
+        CLASSIFICATION,
+        on=D,
+        policy=policy,
+        lots=build_lots(events),
+        rates=rates,
+    )
+
+
+def equity_sells(proposal: Proposal) -> list[str]:
+    return sorted(t.ticker for t in proposal.sells if t.sleeve == "equity")
+
+
+def test_min_tax_sells_the_loss_lot_not_the_winner() -> None:
+    """The headline. Trimming equity by a few thousand dollars can
+    realise a $12,000 long-term gain or harvest a short-term loss,
+    depending on which holding is sold. Ranking lots by tax per dollar
+    picks the loss without any list saying losses go first."""
+    proposal = propose_with_lots(LOTTED)
+    assert equity_sells(proposal) == ["AAPL"]
+
+    aapl = next(t for t in proposal.sells if t.ticker == "AAPL")
+    assert aapl.realized_gain is not None
+    assert aapl.realized_gain.is_negative
+    assert all(sel.period.value == "short" for sel in aapl.lots)
+
+
+def test_fifo_sells_the_oldest_lot_instead() -> None:
+    """Same portfolio, different policy, different trade. The policy is
+    recorded on the proposal so the choice can be explained later."""
+    proposal = propose_with_lots(
+        LOTTED, RebalancePolicy(lot_method=LotMethod.FIFO), rates=None
+    )
+    assert equity_sells(proposal) == ["VTI"]
+    vti = next(t for t in proposal.sells if t.ticker == "VTI")
+    assert vti.realized_gain is not None
+    assert not vti.realized_gain.is_negative
+
+
+def test_hifo_needs_no_rates_and_still_prefers_the_high_basis_lot() -> None:
+    proposal = propose_with_lots(
+        LOTTED, RebalancePolicy(lot_method=LotMethod.HIFO), rates=None
+    )
+    assert equity_sells(proposal) == ["AAPL"]
+
+
+def test_lot_quantities_sum_to_the_order() -> None:
+    """A trade's lots ARE the trade. If they did not add up, the ledger
+    would consume a different disposal than the one the gate judged."""
+    proposal = propose_with_lots(LOTTED)
+    for trade in proposal.sells:
+        assert trade.lots
+        total = sum((sel.quantity for sel in trade.lots), Shares.zero())
+        assert total == trade.quantity
+        proceeds = sum((sel.proceeds for sel in trade.lots), Money.zero())
+        assert proceeds == trade.consideration
+
+
+def test_the_identification_travels_into_the_ledger() -> None:
+    """The order was sized against specific lots, so the Sell event
+    names them, and rebuilding lots from the ledger consumes exactly
+    those — not FIFO's choice."""
+    proposal = propose_with_lots(LOTTED)
+    events = proposal.to_events(100)
+
+    sells = [e for e in events if e.__class__.__name__ == "Sell"]
+    assert sells
+    assert all(getattr(e, "lot_ids", ()) for e in sells)
+
+    after = build_lots([*LOTTED, *events])
+    # VTI was the winner; min-tax left it alone, so the 2024 lot is
+    # intact. FIFO replay would have eaten into it instead.
+    assert [lot.quantity for lot in after["VTI"]] == [Shares("300")]
+    assert sum((lot.quantity.quantity for lot in after["AAPL"]), Decimal(0)) < 100
+
+
+def test_lots_that_disagree_with_positions_are_refused() -> None:
+    """Lots and positions are two views of one ledger. If they differ,
+    one is wrong, and sizing a sale against the wrong one hands the
+    custodian an order that bounces."""
+    lots = build_lots(LOTTED)
+    lots["AAPL"] = lots["AAPL"][:0]  # the lots have gone missing
+    with pytest.raises(LotError, match="must agree"):
+        generate_proposal(
+            fold(LOTTED), PRICES, MODEL, CLASSIFICATION, on=D, lots=lots, rates=HIGH
+        )
+
+
+def test_min_tax_without_rates_is_refused() -> None:
+    """Guessing a bracket would produce an authoritative-looking tax
+    figure that is not."""
+    with pytest.raises(LotError, match="requires the client's tax rates"):
+        propose_with_lots(LOTTED, rates=None)
+
+
+def test_specific_id_is_not_a_rebalancing_policy() -> None:
+    with pytest.raises(ValueError, match="not a rebalancing policy"):
+        RebalancePolicy(lot_method=LotMethod.SPECIFIC_ID)
+
+
+def test_without_lots_sells_carry_no_identification() -> None:
+    """The proportional path, for accounts where lot choice has no tax
+    consequence. An unknown gain is None, not zero."""
+    proposal = propose(DRIFTED)
+    assert proposal.sells
+    for trade in proposal.sells:
+        assert trade.lots == ()
+        assert trade.realized_gain is None
+
+
+# ============================================================
+# PROPERTIES OVER PORTFOLIOS WITH REAL LOT HISTORIES
+# ============================================================
+
+
+@st.composite
+def lotted_portfolios(draw: st.DrawFn) -> list[LedgerEvent]:
+    """Several purchases per ticker, at varied dates and prices, so lots
+    genuinely differ in basis and holding period — the case where lot
+    choice matters and ties are rare."""
+    deposit = Money.from_cents(draw(st.integers(100_000_00, 5_000_000_00)))
+    events: list[LedgerEvent] = [Deposit(1, date(2023, 1, 3), deposit)]
+
+    tickers = ["VTI", "AAPL", "BND", "GLD"]
+    n_lots = draw(st.integers(1, 6))
+    cash = deposit
+    seq = 2
+    day = date(2023, 1, 3)
+
+    for _ in range(n_lots):
+        ticker = draw(st.sampled_from(tickers))
+        # Basis anywhere from half to one-and-a-half times today's price.
+        scale = Decimal(draw(st.integers(50, 150))) / 100
+        price = Price((PRICES[ticker].amount * scale).quantize(Decimal("0.01")))
+        day = day.fromordinal(day.toordinal() + draw(st.integers(1, 300)))
+        if day >= D:
+            break
+        budget = cash.amount * Decimal(draw(st.integers(5, 40))) / 100
+        quantity = int(budget / price.amount)
+        if quantity < 1:
+            continue
+        held = Shares(quantity)
+        events.append(Buy(seq, day, ticker, held, price))
+        cash = cash - held.value_at(price)
+        seq += 1
+
+    return events
+
+
+@given(events=lotted_portfolios())
+@settings(max_examples=150, suppress_health_check=[HealthCheck.too_slow])
+def test_lot_aware_proposals_are_applicable(events: list[LedgerEvent]) -> None:
+    proposal = propose_with_lots(events)
+    fold([*events, *proposal.to_events(1000)])
+
+
+@given(events=lotted_portfolios())
+@settings(max_examples=150, suppress_health_check=[HealthCheck.too_slow])
+def test_lot_aware_proposals_conserve_value(events: list[LedgerEvent]) -> None:
+    before = fold(events)
+    proposal = propose_with_lots(events)
+    after = fold([*events, *proposal.to_events(1000)])
+    assert after.total_value(PRICES) == before.total_value(PRICES)
+
+
+@given(events=lotted_portfolios())
+@settings(max_examples=150, suppress_health_check=[HealthCheck.too_slow])
+def test_lot_aware_generation_is_deterministic(events: list[LedgerEvent]) -> None:
+    assert propose_with_lots(events).trades == propose_with_lots(events).trades
+
+
+@given(events=lotted_portfolios())
+@settings(max_examples=150, suppress_health_check=[HealthCheck.too_slow])
+def test_the_ledger_replays_the_lots_the_order_named(
+    events: list[LedgerEvent],
+) -> None:
+    """Two routes to the same disposal. The rebalancer picked lots and
+    recorded them; replaying the Sell under specific identification
+    must consume the same lots in the same quantities, and the lots
+    left afterwards must still add up to the position."""
+    lots_before = build_lots(events)
+    proposal = propose_with_lots(events)
+
+    for trade in proposal.sells:
+        replayed = dispose(
+            lots_before[trade.ticker],
+            trade.quantity,
+            trade.price,
+            on=D,
+            method=LotMethod.SPECIFIC_ID,
+            chosen=[sel.lot_id for sel in trade.lots],
+        )
+        # Compared by lot, not by position: `dispose` reports in the
+        # ledger's lot order, the trade in consumption order. Same set,
+        # same quantities, same basis — that is the identification.
+        assert {d.lot_id: d.quantity for d in replayed.disposals} == {
+            sel.lot_id: sel.quantity for sel in trade.lots
+        }
+        assert replayed.cost_basis == sum(
+            (sel.cost_basis for sel in trade.lots), Money.zero()
+        )
+
+    combined = [*events, *proposal.to_events(1000)]
+    positions = fold(combined).positions
+    lots_after = build_lots(combined)
+    for ticker, held in positions.items():
+        in_lots = sum(
+            (lot.quantity.quantity for lot in lots_after.get(ticker, [])), Decimal(0)
+        )
+        assert in_lots == held.quantity
+
+
+# ============================================================
+# THE CASH TRIGGER
+# ============================================================
+# Drift is measured over invested value, so a deposit sitting as cash
+# moves no sleeve and trips no band. A policy can say that idle cash is
+# itself a reason to act.
+
+ON_TARGET_WITH_CASH: list[LedgerEvent] = [
+    Deposit(1, D, Money("110000.00")),
+    Buy(2, D, "VTI", Shares("392.857"), Price("140.00")),  # ~55,000
+    Buy(3, D, "BND", Shares("700"), Price("50.00")),  # 35,000
+    Buy(4, D, "GLD", Shares("66.666"), Price("150.00")),  # ~10,000
+    # 10,000 left as cash: 9% of the account, every sleeve on target.
+]
+
+
+def test_without_a_trigger_idle_cash_waits_for_a_breach() -> None:
+    """The default. Nothing is breached, so nothing happens — and the
+    cash sits there. True of the bands, false of the portfolio."""
+    proposal = propose(ON_TARGET_WITH_CASH)
+    assert proposal.is_empty
+    assert proposal.trigger == "none"
+
+
+def test_idle_cash_above_the_trigger_is_deployed() -> None:
+    """With a 2% trigger, 9% cash is a reason to act. Buys only: there
+    is no overweight to sell, just money to put to work."""
+    proposal = propose(
+        ON_TARGET_WITH_CASH, RebalancePolicy(cash_trigger=Weight("0.02"))
+    )
+    assert proposal.trigger == "cash"
+    assert proposal.buys
+    assert not proposal.sells
+    assert proposal.cash_after < Money("500.00")
+
+
+def test_cash_below_the_trigger_is_left_alone() -> None:
+    proposal = propose(
+        ON_TARGET_WITH_CASH, RebalancePolicy(cash_trigger=Weight("0.20"))
+    )
+    assert proposal.is_empty
+
+
+def test_a_breach_is_recorded_as_the_trigger_even_with_cash() -> None:
+    proposal = propose(DRIFTED, RebalancePolicy(cash_trigger=Weight("0.02")))
+    assert proposal.trigger == "band"
+
+
+def test_the_cash_buffer_does_not_count_as_idle() -> None:
+    """Cash the policy holds back on purpose is not cash drag."""
+    proposal = propose(
+        ON_TARGET_WITH_CASH,
+        RebalancePolicy(cash_trigger=Weight("0.02"), cash_buffer=Money("9000.00")),
+    )
+    assert proposal.is_empty
+
+
+def test_cash_trigger_must_be_a_fraction() -> None:
+    with pytest.raises(ValueError, match="cash_trigger"):
+        RebalancePolicy(cash_trigger=Weight("1.5"))
+
+
+@given(events=drifted_portfolios())
+@settings(max_examples=150, suppress_health_check=[HealthCheck.too_slow])
+def test_cash_triggered_proposals_are_applicable(events: list[LedgerEvent]) -> None:
+    """The second trigger goes through the same machinery and must keep
+    the same guarantees: applicable, and value-conserving."""
+    policy = RebalancePolicy(cash_trigger=Weight("0.01"))
+    before = fold(events)
+    proposal = propose(events, policy)
+    after = fold([*events, *proposal.to_events(1000)])
+    assert after.total_value(PRICES) == before.total_value(PRICES)

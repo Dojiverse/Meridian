@@ -59,9 +59,8 @@ that are most often implemented wrongly:
 WHAT IS DELIBERATELY NOT HERE
 ============================================================
 
-Wash sales are Phase 05 — the field exists on the lot
-(`disallowed_loss_added`) so that basis adjustments have somewhere to
-land, but nothing computes it yet.
+Wash-sale detection lives in `washsale.py`; the field on the lot
+(`disallowed_loss_added`) is where its basis adjustments land.
 
 The AVERAGE COST method is not implemented, and that is a rule rather
 than an omission: it is available only for regulated investment company
@@ -92,6 +91,7 @@ __all__ = [
     "build_lots",
     "holding_period",
     "is_covered",
+    "lot_sort_key",
     "select_lots",
     "settlement_date",
 ]
@@ -237,9 +237,8 @@ class TaxLot:
 
     covered: bool = True
     disallowed_loss_added: Money | None = None
-    """Wash-sale basis adjustment carried into this lot. Populated in
-    Phase 05; present now so the field does not have to be retrofitted
-    onto records that already exist."""
+    """Wash-sale basis adjustment carried into this lot, applied by
+    `washsale.apply_basis_adjustment`."""
 
     def __post_init__(self) -> None:
         if self.quantity.quantity <= 0:
@@ -421,6 +420,63 @@ def select_lots(
     return picked
 
 
+def lot_sort_key(
+    lot: TaxLot,
+    method: LotMethod,
+    *,
+    on: date,
+    price: Price,
+    rates: TaxRates | None = None,
+) -> tuple[Decimal, str]:
+    """The ranking a method applies to one lot. Lower sorts first.
+
+    This is the SINGLE definition of what each method means, used both
+    by `select_lots` for a sale of one security and by the rebalancer
+    when it chooses which lots to sell across a whole sleeve.
+
+    Every key is expressed PER DOLLAR OF PROCEEDS rather than per share,
+    which is what makes it comparable across securities. Within one
+    ticker the price is a constant, so dividing by it changes nothing
+    about the order — HIFO still takes the highest basis first. Across
+    tickers it is the only normalisation that means anything: a $180
+    basis on a $180 stock and a $50 basis on a $50 bond are the same
+    position for tax purposes, and a per-share key would rank them as
+    if they were not.
+
+    Every key ends in `lot_id` as a total order. Two lots bought the same
+    day at the same price are interchangeable for tax purposes, but they
+    must still be SELECTED in a stable order — otherwise the same
+    instruction produces different lot records on different runs, and a
+    past disposal cannot be reproduced.
+    """
+    if method is LotMethod.SPECIFIC_ID:
+        raise LotError(
+            "SPECIFIC_ID has no ranking — the lots are named by the taxpayer, "
+            "in the order given"
+        )
+    if price.amount <= 0:
+        raise LotError(f"cannot rank lots at a non-positive price {price}")
+
+    if method is LotMethod.FIFO:
+        return (Decimal(lot.acquired.toordinal()), lot.lot_id)
+
+    if method is LotMethod.LIFO:
+        return (-Decimal(lot.acquired.toordinal()), lot.lot_id)
+
+    if method is LotMethod.HIFO:
+        # Highest basis per dollar of proceeds first.
+        return (-(lot.basis_per_share() / price.amount), lot.lot_id)
+
+    if rates is None:
+        raise LotError("MIN_TAX requires the client's tax rates")
+
+    gain_per_share = price.amount - lot.basis_per_share()
+    rate = rates.rate_for(lot.period_at(on)).value
+    # Tax per dollar raised. Negative for a loss, which is why losses
+    # rank first without any list saying they should.
+    return (gain_per_share * rate / price.amount, lot.lot_id)
+
+
 def _order_lots(
     lots: Sequence[TaxLot],
     method: LotMethod,
@@ -430,14 +486,7 @@ def _order_lots(
     rates: TaxRates | None,
     chosen: Sequence[str] | None,
 ) -> list[TaxLot]:
-    """Rank lots by the chosen method.
-
-    Every sort key ends in `lot_id` as a total order. Two lots bought
-    the same day at the same price are genuinely interchangeable for
-    tax purposes, but they must still be SELECTED in a stable order —
-    otherwise the same instruction produces different lot records on
-    different runs, and a past disposal cannot be reproduced.
-    """
+    """Rank lots by the chosen method — see `lot_sort_key`."""
     if method is LotMethod.SPECIFIC_ID:
         if not chosen:
             raise LotError("SPECIFIC_ID requires the lot ids to be named")
@@ -447,24 +496,10 @@ def _order_lots(
             raise LotError(f"identified lots not held: {', '.join(missing)}")
         return [by_id[lot_id] for lot_id in chosen]
 
-    if method is LotMethod.FIFO:
-        return sorted(lots, key=lambda lot: (lot.acquired, lot.lot_id))
-
-    if method is LotMethod.LIFO:
-        return sorted(lots, key=lambda lot: (lot.acquired, lot.lot_id), reverse=True)
-
-    if method is LotMethod.HIFO:
-        return sorted(lots, key=lambda lot: (-lot.basis_per_share(), lot.lot_id))
-
-    if rates is None:
-        raise LotError("MIN_TAX requires the client's tax rates")
-
-    def tax_per_share(lot: TaxLot) -> Decimal:
-        gain = price.amount - lot.basis_per_share()
-        rate = rates.rate_for(lot.period_at(on)).value
-        return gain * rate
-
-    return sorted(lots, key=lambda lot: (tax_per_share(lot), lot.lot_id))
+    return sorted(
+        lots,
+        key=lambda lot: lot_sort_key(lot, method, on=on, price=price, rates=rates),
+    )
 
 
 # ============================================================
@@ -619,10 +654,16 @@ def build_lots(
 ) -> dict[str, list[TaxLot]]:
     """Replay a ledger event stream into open tax lots per ticker.
 
-    Buys open lots; sells consume them by `method`. The same fold shape
-    as the ledger's, carrying lots instead of a share count — because a
-    share count is exactly the information that turns out not to be
-    enough.
+    Buys open lots; sells consume them by `method` — unless the Sell
+    names its own lots, in which case THOSE are consumed, by specific
+    identification. An order that was sized against particular lots and
+    then replayed under FIFO would leave the books describing a sale
+    that never happened; the identification travels with the event so
+    that cannot occur.
+
+    The same fold shape as the ledger's, carrying lots instead of a
+    share count — because a share count is exactly the information that
+    turns out not to be enough.
     """
     from meridian.ledger import Buy, Sell  # local: avoids a cycle
 
@@ -642,14 +683,24 @@ def build_lots(
             )
         elif isinstance(event, Sell):
             held = lots.get(event.ticker, [])
-            result = dispose(
-                held,
-                event.quantity,
-                event.price,
-                on=event.on,
-                method=method,
-                rates=rates,
-            )
+            if event.lot_ids:
+                result = dispose(
+                    held,
+                    event.quantity,
+                    event.price,
+                    on=event.on,
+                    method=LotMethod.SPECIFIC_ID,
+                    chosen=event.lot_ids,
+                )
+            else:
+                result = dispose(
+                    held,
+                    event.quantity,
+                    event.price,
+                    on=event.on,
+                    method=method,
+                    rates=rates,
+                )
             lots[event.ticker] = list(result.remaining_lots)
 
     return {ticker: open_lots for ticker, open_lots in lots.items() if open_lots}

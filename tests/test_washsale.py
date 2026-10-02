@@ -18,6 +18,7 @@ from meridian.money import Money, Price, Shares, Weight
 from meridian.taxlot import Disposal, HoldingPeriod, TaxLot, TaxRates, dispose
 from meridian.washsale import (
     Acquisition,
+    HarvestOpportunity,
     MatchOutcome,
     SubstituteMap,
     apply_basis_adjustment,
@@ -702,3 +703,39 @@ def test_basis_adjustment_preserves_total_economics(quantity: int) -> None:
     )
     result = dispose([adjusted], Shares(quantity), Price("90.00"), on=date(2026, 12, 1))
     assert result.realized_gain == disallowed
+
+
+def test_the_block_reason_names_the_worst_blocker_not_the_first() -> None:
+    """A taxable purchase and an IRA purchase both sit in the window.
+    The earlier one only defers; the IRA one forfeits. The reason must
+    say forfeited, because that is what will happen."""
+    lot_ = TaxLot("gld-1", "GLD", date(2024, 1, 1), Shares("100"), Money("20000.00"))
+    opportunity = HarvestOpportunity(
+        lot=lot_,
+        account_id="taxable-1",
+        account_type=AccountType.TAXABLE,
+        market_value=Money("15000.00"),
+        unrealized_loss=Money("-5000.00"),
+        period=HoldingPeriod.LONG,
+        tax_benefit=Money("1190.00"),
+        blocked_by=(
+            Acquisition(
+                "a",
+                "taxable-1",
+                AccountType.TAXABLE,
+                "GLD",
+                date(2026, 6, 1),
+                Shares("10"),
+            ),
+            Acquisition(
+                "b",
+                "roth-1",
+                AccountType.ROTH_IRA,
+                "GLD",
+                date(2026, 6, 10),
+                Shares("10"),
+            ),
+        ),
+    )
+    assert "PERMANENTLY FORFEITED" in opportunity.block_reason
+    assert "roth-1" in opportunity.block_reason

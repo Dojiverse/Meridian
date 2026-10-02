@@ -187,13 +187,20 @@ def create_app(store: Store) -> FastAPI:
         """
         state = _require_account(account_id)
         portfolio = state.portfolio()
+        lots = state.lots()
 
+        # Lot-aware sells only where lots have a tax consequence. Inside
+        # a Roth every lot costs the same to sell — nothing — so the
+        # proportional path is the honest one there.
+        taxable = not state.account.account_type.is_tax_advantaged
         proposal = generate_proposal(
             portfolio,
             store.prices,
             state.model,
             state.classification,
             on=store.today,
+            lots=lots if taxable else None,
+            rates=state.rates if taxable else None,
         )
 
         context = ComplianceContext(
@@ -203,7 +210,7 @@ def create_app(store: Store) -> FastAPI:
             on=store.today,
             account_id=account_id,
             account_type=state.account.account_type,
-            lots=state.lots(),
+            lots=lots,
             # Household scope, not account scope — see
             # Store.household_acquisitions.
             acquisitions=store.household_acquisitions(account_id),

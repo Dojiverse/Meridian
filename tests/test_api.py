@@ -62,6 +62,9 @@ MONETARY_KEYS = {
     "target",
     "drift",
     "band_width",
+    "proceeds",
+    "gain",
+    "realized_gain",
 }
 """Every field carrying an exact decimal. Shares and weights are here
 too: a quantity of 53.353 and a weight of 0.166667 are values the server
@@ -463,3 +466,34 @@ def test_the_page_reflects_engine_state_rather_than_its_own(
     alt_after = next(s for s in after["sleeves"] if s["sleeve"] == "alt")
     assert alt_before["drift_display"] == "+5.0%"
     assert alt_after["drift_display"] == "+22.0%"
+
+
+# ============================================================
+# LOTS ON THE WIRE
+# ============================================================
+
+
+def test_taxable_sells_name_their_lots(client: TestClient) -> None:
+    """A sell in a taxable account was sized lot by lot, and the order
+    says which — the identification Treas. Reg. 1.1012-1(c) asks for,
+    present on the wire rather than reconstructed later."""
+    body = client.post("/api/accounts/taxable-1/proposals").json()
+    sells = [t for t in body["trades"] + body["blocked"] if t["side"] == "sell"]
+    assert sells
+    for trade in sells:
+        assert trade["lots"], f"{trade['ticker']} sell has no lot identification"
+        assert isinstance(trade["realized_gain"], str)
+        quantities = sum(Decimal(sel["quantity"]) for sel in trade["lots"])
+        assert quantities == Decimal(trade["quantity"])
+
+
+def test_roth_sells_carry_no_lots_and_no_gain(client: TestClient) -> None:
+    """Inside a Roth no lot is cheaper than another, so sells are sized
+    proportionally and the gain is null — not zero. An unknown gain is
+    not a gain of nothing."""
+    body = client.post("/api/accounts/roth-1/proposals").json()
+    sells = [t for t in body["trades"] + body["blocked"] if t["side"] == "sell"]
+    assert sells
+    for trade in sells:
+        assert trade["lots"] == []
+        assert trade["realized_gain"] is None

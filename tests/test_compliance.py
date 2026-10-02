@@ -26,7 +26,7 @@ from meridian.ledger import Buy, Deposit, LedgerEvent, fold
 from meridian.model import Model, Sleeve
 from meridian.money import Money, Price, Shares, Weight
 from meridian.rebalance import RebalancePolicy, Side, generate_proposal
-from meridian.taxlot import TaxLot
+from meridian.taxlot import LotMethod, TaxLot, TaxRates, build_lots
 from meridian.washsale import Acquisition, SubstituteMap
 
 D = date(2026, 9, 8)
@@ -70,11 +70,20 @@ def context(
     substitutes: SubstituteMap | None = None,
     account_type: AccountType = AccountType.TAXABLE,
     policy: RebalancePolicy | None = None,
+    lot_aware: bool = False,
+    rates: TaxRates | None = None,
 ) -> ComplianceContext:
     stream = events or DRIFTED
     portfolio = fold(stream)
     proposal = generate_proposal(
-        portfolio, PRICES, MODEL, CLASSIFICATION, on=D, policy=policy
+        portfolio,
+        PRICES,
+        MODEL,
+        CLASSIFICATION,
+        on=D,
+        policy=policy,
+        lots=build_lots(stream) if lot_aware else None,
+        rates=rates,
     )
     return ComplianceContext(
         proposal=proposal,
@@ -497,3 +506,48 @@ def test_an_empty_gate_passes_everything() -> None:
     ctx = context()
     result = gate().evaluate(ctx)
     assert result.passed == ctx.proposal.trades
+
+
+# ============================================================
+# THE GATE JUDGES THE LOTS THE ORDER NAMES
+# ============================================================
+
+
+def test_the_gate_uses_the_named_lots_not_a_fifo_guess() -> None:
+    """Two GLD lots: an old cheap one (long-term) and a recent one bought
+    just below today's price (short-term, small gain). The alt sleeve is
+    overweight and must sell some GLD.
+
+    Under FIFO the sale would come from the long-term lot and no
+    short-term warning is due. Under LIFO the order names the recent
+    lot, and the gate must warn about THAT lot — not about what FIFO
+    would have done.
+    """
+    history: list[LedgerEvent] = [
+        Deposit(1, date(2024, 1, 2), Money("100000.00")),
+        Buy(2, date(2024, 1, 2), "VTI", Shares("300"), Price("140.00")),
+        Buy(3, date(2024, 1, 2), "AAPL", Shares("100"), Price("180.00")),
+        Buy(4, date(2024, 1, 2), "BND", Shares("500"), Price("50.00")),
+        Buy(5, date(2024, 1, 2), "GLD", Shares("50"), Price("100.00")),  # long
+        Buy(6, date(2026, 8, 1), "GLD", Shares("50"), Price("120.00")),  # short
+    ]
+    limit = ShortTermGainLimit("stcg", Money("10.00"))
+
+    recent_first = gate(limit).evaluate(
+        context(
+            history,
+            lot_aware=True,
+            policy=RebalancePolicy(lot_method=LotMethod.LIFO),
+        )
+    )
+    assert recent_first.warnings
+    assert recent_first.warnings[0].subject == "GLD"
+
+    oldest_first = gate(limit).evaluate(
+        context(
+            history,
+            lot_aware=True,
+            policy=RebalancePolicy(lot_method=LotMethod.FIFO),
+        )
+    )
+    assert not oldest_first.warnings

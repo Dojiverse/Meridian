@@ -33,6 +33,7 @@ from meridian.taxlot import (
     dispose,
     holding_period,
     is_covered,
+    lot_sort_key,
     select_lots,
     settlement_date,
 )
@@ -512,3 +513,84 @@ def test_niit_stacks_on_top_of_the_capital_gains_rate() -> None:
     )
     assert mid.rate_for(HoldingPeriod.LONG) == Weight("0.188")
     assert mid.rate_for(HoldingPeriod.SHORT) == Weight("0.358")
+
+
+# ============================================================
+# THE SORT KEY — one definition, comparable across securities
+# ============================================================
+
+
+def test_hifo_compares_basis_per_dollar_not_per_share() -> None:
+    """A $180 basis on a $180 stock has no embedded gain. A $60 basis
+    on a $50 bond is sitting at a loss. HIFO should take the bond
+    first — which a per-share key ($180 > $60) would get backwards."""
+    stock = lot("stock", "2024-01-01", "100", "18000.00", ticker="AAPL")
+    bond = lot("bond", "2024-01-01", "100", "6000.00", ticker="BND")
+
+    stock_key = lot_sort_key(stock, LotMethod.HIFO, on=SALE_ON, price=Price("180"))
+    bond_key = lot_sort_key(bond, LotMethod.HIFO, on=SALE_ON, price=Price("50"))
+    assert bond_key < stock_key
+
+
+def test_min_tax_key_is_negative_for_a_loss() -> None:
+    """Losses rank first as a consequence of the arithmetic, not because
+    a list says they should."""
+    key = lot_sort_key(
+        LOTS[2], LotMethod.MIN_TAX, on=SALE_ON, price=SALE_PRICE, rates=HIGH
+    )
+    assert key[0] < 0
+
+
+def test_the_key_refuses_to_rank_for_specific_id() -> None:
+    with pytest.raises(LotError, match="no ranking"):
+        lot_sort_key(LOTS[0], LotMethod.SPECIFIC_ID, on=SALE_ON, price=SALE_PRICE)
+
+
+def test_select_lots_and_the_key_agree() -> None:
+    """`select_lots` is the key applied to one ticker. If they ever
+    diverged, the rebalancer and a plain sale would dispose of different
+    lots for the same instruction."""
+    for method in (LotMethod.FIFO, LotMethod.LIFO, LotMethod.HIFO, LotMethod.MIN_TAX):
+        picked = [lot_.lot_id for lot_, _ in pick(LOTS, "300", method, rates=HIGH)]
+        ranked = [
+            lot_.lot_id
+            for lot_ in sorted(
+                LOTS,
+                key=lambda lot_: lot_sort_key(
+                    lot_, method, on=SALE_ON, price=SALE_PRICE, rates=HIGH
+                ),
+            )
+        ]
+        assert picked == ranked
+
+
+# ============================================================
+# A SELL THAT NAMES ITS LOTS
+# ============================================================
+
+
+def test_a_sell_that_names_its_lots_is_replayed_by_specific_id() -> None:
+    """FIFO would consume the 2024 lot. The event says otherwise, and
+    the event wins — because it is what the order was actually sized
+    against, and what the broker was told."""
+    events: list[LedgerEvent] = [
+        Deposit(1, date(2024, 1, 2), Money("100000.00")),
+        Buy(2, date(2024, 1, 2), "VTI", Shares("100"), Price("140.00")),
+        Buy(3, date(2025, 6, 2), "VTI", Shares("100"), Price("180.00")),
+        Sell(4, date(2026, 9, 8), "VTI", Shares("50"), Price("200.00"), ("VTI-3",)),
+    ]
+    lots = build_lots(events)
+
+    by_date = {lot_.acquired: lot_ for lot_ in lots["VTI"]}
+    assert by_date[date(2024, 1, 2)].quantity == Shares("100")  # untouched
+    assert by_date[date(2025, 6, 2)].quantity == Shares("50")
+
+
+def test_naming_a_lot_that_is_not_held_is_refused_on_replay() -> None:
+    events: list[LedgerEvent] = [
+        Deposit(1, date(2024, 1, 2), Money("100000.00")),
+        Buy(2, date(2024, 1, 2), "VTI", Shares("100"), Price("140.00")),
+        Sell(3, date(2026, 9, 8), "VTI", Shares("50"), Price("200.00"), ("ghost",)),
+    ]
+    with pytest.raises(LotError, match="not held"):
+        build_lots(events)

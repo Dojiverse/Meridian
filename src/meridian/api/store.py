@@ -39,7 +39,7 @@ from meridian.ledger import LedgerEvent, Portfolio, fold
 from meridian.model import Model
 from meridian.money import Price
 from meridian.rebalance import Proposal
-from meridian.taxlot import TaxLot, build_lots
+from meridian.taxlot import TaxLot, TaxRates, build_lots
 from meridian.washsale import Acquisition, SubstituteMap
 
 __all__ = ["AccountState", "Store", "StoredProposal"]
@@ -74,6 +74,9 @@ class AccountState:
     events: list[LedgerEvent] = field(default_factory=list)
     gate: ComplianceGate = field(default_factory=lambda: ComplianceGate(()))
     substitutes: SubstituteMap | None = None
+    rates: TaxRates | None = None
+    """The client's marginal rates, for lot selection. None for a
+    tax-advantaged account, where no lot is cheaper than another."""
 
     def portfolio(self) -> Portfolio:
         """Folded on every read, never cached.
