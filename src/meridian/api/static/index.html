@@ -119,6 +119,13 @@
   .buy { color: var(--accent); font-weight: 600; }
   .sell { color: var(--crit); font-weight: 600; }
   .struck { opacity: .5; text-decoration: line-through; }
+  /* Draw the eye to the panel that just changed, then fade. */
+  @keyframes settle {
+    from { box-shadow: 0 0 0 3px var(--accent); }
+    to   { box-shadow: 0 0 0 3px transparent; }
+  }
+  .changed { animation: settle 1.6s ease-out; }
+  @media (prefers-reduced-motion: reduce) { .changed { animation: none; } }
 </style>
 </head>
 <body>
@@ -148,12 +155,12 @@
     <div class="panel"><div id="positions"></div></div>
   </section>
 
-  <section>
+  <section id="proposal-section">
     <h2>Proposal</h2>
     <div class="panel"><div id="proposal"><p class="empty">No proposal yet.</p></div></div>
   </section>
 
-  <section>
+  <section id="audit-section">
     <h2>Audit trail</h2>
     <div class="panel"><div id="audit"></div></div>
   </section>
@@ -199,6 +206,18 @@ async function post(path, body) {
 const pct = (w) => (parseFloat(w) * 100).toFixed(1) + "%";
 
 let currentAccount = null;
+
+// After an action, take the reader to the part of the page that
+// changed and mark it. A button whose effect lands below the fold
+// looks like a button that did nothing.
+function reveal(sectionId, { scroll = true } = {}) {
+  const section = $(sectionId);
+  if (scroll) section.scrollIntoView({ behavior: "smooth", block: "start" });
+  const panel = section.querySelector(".panel");
+  panel.classList.remove("changed");
+  void panel.offsetWidth;  // restart the animation if it is already running
+  panel.classList.add("changed");
+}
 
 // ---- drift --------------------------------------------------
 
@@ -336,7 +355,9 @@ async function decide(id, what) {
       ? { actor, note: "reviewed in the blotter" }
       : { actor, reason: "not proceeding today" };
     renderProposal(await post(`/api/proposals/${id}/${what}`, body));
+    reveal("proposal-section", { scroll: false });
     await refreshAudit();
+    reveal("audit-section", { scroll: false });
   } catch (e) {
     alert(e.message);
   }
@@ -388,6 +409,7 @@ $("propose").onclick = async () => {
   try {
     renderProposal(await post(`/api/accounts/${currentAccount}/proposals`));
     $("status").textContent = "";
+    reveal("proposal-section");
     await refreshAudit();
   } catch (e) {
     $("status").textContent = e.message;
