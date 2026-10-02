@@ -75,7 +75,12 @@ from meridian.washsale import blackout_tickers, find_harvest_opportunities
 
 STATIC = Path(__file__).parent / "static"
 
-SESSION_COOKIE = "meridian_demo"
+SESSION_COOKIE = "__session"
+"""Firebase Hosting forwards exactly one cookie to a Cloud Run backend,
+and it has to be called __session; every other cookie is stripped on
+the way through. Any other name works on the service's own URL and
+silently fails behind the hosting rewrite, with every request arriving
+as a brand-new visitor."""
 MAX_SESSIONS = 200
 """How many visitor worlds to keep in memory before dropping the one
 idle longest. Each is a few kilobytes of events; two hundred is plenty

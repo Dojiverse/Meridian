@@ -594,7 +594,8 @@ def test_the_session_cookie_is_set_once_and_reused() -> None:
     app = create_app(build_demo_store)
     with TestClient(app) as client:
         first = client.get("/api/accounts")
-        assert "meridian_demo" in first.cookies
+        # __session is the one cookie Firebase Hosting forwards to Cloud Run.
+        assert "__session" in first.cookies
         client.post("/api/accounts/roth-1/proposals")
         again = client.get("/api/audit").json()
         assert len(again["entries"]) == 1  # same world, state kept
