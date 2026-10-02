@@ -437,10 +437,11 @@ anything below `min_trade`. Same threshold for "worth trading" and
 2. **Cash first.** Not a special case — targets are measured against
    total *investable* value, so idle cash shows up as a shortfall across
    the sleeves and gets spent before anything is sold.
-3. **Which security within a sleeve** — proportional to what is already
-   held, split through the same `allocate()` the money uses everywhere.
-   (Phase 04 replaces this for sells, where tax lots make some shares
-   much more expensive to sell than others.)
+3. **Which security within a sleeve** — buys top up in proportion to
+   what is already held, split through the same `allocate()` the money
+   uses everywhere. Sells were proportional too, until Phase 09 — where
+   tax lots make some shares much more expensive to sell than others,
+   and the sleeve's lots get ranked together by tax cost instead.
 4. **Rounding direction** — always toward zero. A buy rounded up can't
    be funded; a sell rounded up sells shares that aren't held.
 
@@ -1033,7 +1034,7 @@ Phase 01.
 
 ## Phase 08 — Advisor interface
 
-**Status: complete.** 307 tests, mypy strict clean, ruff clean.
+**Status: complete.** 307 tests at the time, mypy strict clean, ruff clean.
 
 ```bash
 python -m meridian.api      # then open http://127.0.0.1:8000
@@ -1118,10 +1119,24 @@ them from separate endpoints could render a trade list with the blocks
 still loading — and an advisor who approves what is on screen has
 approved something the gate rejected.
 
-**Approval is refused while blocks stand** (HTTP 422). Overriding a
-block is a separate, separately recorded decision — not an approval. And
-a decision is made once: re-approving returns 409, because changing it
-would mean the record of what was approved is no longer true.
+**Approval executes the gated list.** The gate has already removed
+every blocked trade and re-checked that the survivors are fundable, so
+approving the survivors is executing exactly what it allowed — not an
+override. The audit entry records how many trades were executed and how
+many removed, so "approved" can never be read as "approved everything
+that was proposed". Only a proposal with *nothing* surviving is refused
+(HTTP 422): there is nothing to approve. Overriding a blocked trade
+would be a separate, separately recorded decision, and this endpoint
+never does that. And a decision is made once: re-approving returns 409,
+because changing it would mean the record of what was approved is no
+longer true.
+
+(The first version refused approval whenever *any* block stood. The
+two-year history in Phase 09 showed what that does in practice: the
+model's proportional top-up always included one restricted stock, the
+gate always blocked that one buy, and so every review was rejected
+outright and $27,000 sat idle for a year. The gate had done its job;
+the approval rule threw the result away.)
 
 Approving requires an actor with no default of `"system"`, and rejecting
 requires a reason. An approval that cannot name who gave it is not an
@@ -1173,8 +1188,230 @@ tomorrow.
 
 ---
 
+## Phase 09 — Closing the loop
+
+**Status: complete.** 396 tests, mypy strict clean, ruff clean.
+
+```bash
+python -m meridian.showcase      # two years of history -> showcase/history.json
+```
+
+Three new modules — `harvest.py`, and `showcase/history.py` with
+`showcase/snapshots.py` — and the biggest change to an existing one
+since Phase 03. This phase began as one fix and became six, because the
+way to find out whether an engine is right is to run it for two years
+and read what it did.
+
+### Read the files in this order
+
+| # | File | What to look for |
+|---|---|---|
+| 1 | `src/meridian/rebalance.py` → `_plan_sells_by_lot` | The sleeve, not the security, is the unit |
+| 2 | `src/meridian/taxlot.py` → `lot_sort_key` | One ranking, per dollar, comparable across tickers |
+| 3 | `src/meridian/showcase/history.py` | The script and the engine, and the line between them |
+| 4 | `src/meridian/washsale.py` → `_consume_own_purchase`, `blackout_tickers` | Both halves of §1091 |
+| 5 | `src/meridian/harvest.py` | A finding is not a trade |
+| 6 | `tests/test_showcase.py` | The story, asserted |
+
+---
+
+### 1. Sells choose their lots
+
+Phase 03 said Phase 04 would replace proportional selling with
+lot-aware selling. It never happened. The rebalancer sized every sell
+by market value and the tax lots were only ever consulted by the gate,
+after the fact. A "tax-aware rebalancer" that does not look at lots
+when deciding what to sell is not one.
+
+Now "trim equity by $3,200" means: take every open lot across every
+security in the sleeve, rank them by **tax cost per dollar of proceeds**
+under the policy's method (min-tax by default), and consume the cheapest
+until the amount is raised.
+
+```
+equity sleeve, $3,200 to raise
+
+  VTI   300 sh bought 2024-01-02 at $100, now $140   +$12,000 long
+  AAPL  100 sh bought 2026-08-01 at $200, now $180    -$2,000 short
+
+min_tax  ->  SELL 17.777 AAPL   realising a loss of $355
+fifo     ->  SELL 22.857 VTI    realising a gain of $914
+```
+
+Same portfolio, same delta, same model. Which lot is sold is a policy
+decision with a tax bill attached, and the proposal records which
+policy made it.
+
+**Per dollar, not per share.** A $180 basis on a $180 stock and a $50
+basis on a $50 bond are the same position for tax purposes; a per-share
+key would rank them as if they were not. Dividing by price changes
+nothing within one ticker (the price is a constant) and is the only
+normalisation that means anything across tickers. So there is one
+`lot_sort_key`, used by `select_lots` for a plain sale and by the
+rebalancer for a sleeve. If they diverged, the same instruction would
+dispose of different lots depending on who asked.
+
+**The identification travels.** Each `Trade` carries its
+`LotSelection`s, and `Proposal.to_events` puts their ids on the `Sell`
+event. `build_lots` consumes exactly those lots when it replays. Treas.
+Reg. §1.1012-1(c) makes the identification part of the sale; here it is
+part of the event, and the property test
+`test_the_ledger_replays_the_lots_the_order_named` checks that the two
+routes agree for every generated portfolio.
+
+---
+
+### 2. The two-year history
+
+The engine reads no clock and the demo has one fixed day. Neither shows
+what an append-only ledger is actually for. So `meridian.showcase`
+builds a household — a taxable account and a Roth — and runs it through
+two years with a monthly review, where the rebalancer, the lot selector,
+the harvester, the household wash-sale screen and the compliance gate
+all run for real and every decision lands in the hash-chained log.
+
+The line between **script** and **engine** is the whole point. Deposits,
+dividends, fees, one withdrawal, and two client-directed gold purchases
+are inputs — a real firm gets them from the custodian. Every trade is
+the engine's. If the engine would not have made it, it did not happen.
+
+The output is 170 as-of snapshots — every Friday and every day anything
+happened — each recomputed from the event prefix, with every amount a
+string. The one concession to charting is integer cents and basis
+points, which a double represents exactly.
+
+Prices are seeded random walks, shaped so the history has something to
+show, and the output says they are not market data.
+
+### The story it tells, which was not scripted
+
+```
+2025-11-20  client buys $40,000 of gold, near the top
+2025-12-01  client buys gold in the Roth
+2025-12-15  gold has fallen; the rebalancer trims the overweight and,
+            being tax-aware, picks the loss lot
+            -> BLOCK: washed by the 2025-12-01 purchase in roth-1, and
+               because that is a retirement account the loss would be
+               PERMANENTLY FORFEITED, not deferred [Rev. Rul. 2008-5]
+            -> that sale was funding every buy, so the buys fall too;
+               nothing survives; the review is rejected
+2026-01-15  the window has closed; the same lot is sold, -$2,756,
+            approved; the loss is harvested
+```
+
+`find_wash_sales` over everything that actually happened in the two
+years: **zero findings.** That is `test_the_gate_prevented_every_wash_sale`,
+and it is the assertion this phase exists to make.
+
+---
+
+### 3. Six things running it found
+
+Each was invisible in unit tests and obvious in two years of output.
+
+**Idle cash never triggered anything.** Drift is measured over invested
+value, so a quarterly deposit moves no sleeve and trips no band. The
+first run left $27,000 uninvested for thirteen months while every
+review said "within bands" — true of the bands, false of the portfolio.
+`RebalancePolicy.cash_trigger` (default off) says idle cash above a
+share of value is itself a reason to act, and the proposal records
+which reason it acted for.
+
+**Approval threw the gate's work away.** See Phase 08 above. Approving
+the gated survivors is now the rule; the history approves as gated and
+the audit entry says how many trades were removed.
+
+**A lot counted as its own replacement.** Shares bought on 20 November
+and sold on 15 December were acquired inside the window, so the screen
+flagged them — against *themselves*. The purchase that created each lot
+being sold is now netted out, per account and up to the quantity sold.
+Excess bought the same day still counts, which is why it is a quantity
+and not a flag.
+
+**The detector disagreed with the screen.** After that fix the history
+still showed one wash sale: 22 cents, deferred. An old gold lot and a
+recent one had been sold on the same day; the detector matched the old
+lot's loss against the recent lot's purchase, which the very same sale
+had disposed of. Rev. Rul. 56-602: shares sold in the same transaction
+are not replacement shares. The detector now nets every disposal on a
+day against its own purchase before matching any loss on that day. The
+screen and the detector agree again.
+
+**Harvesting was a screen, not an action.** `find_harvest_opportunities`
+found a $10,309 loss sitting unharvested at the end of the history,
+because nothing acted on findings. `harvest.py` turns one into two
+orders: a whole-lot, lot-identified sell and a buy of the firm's
+designated alternative in the same sleeve, through the same gate as any
+other trade. The first version harvested an entire $85,000 lot for a
+3.7% dip — correct by the dollar floor and plainly churn — so the policy
+now also requires the loss to be a share of basis.
+
+**Half a harvest is worse than none.** That same $85,000 harvest had its
+replacement buy blocked by the concentration limit, and approve-as-gated
+executed the sell alone: out of the market for a month on a position
+the firm meant to keep. A harvest's two legs now share a pair id, and
+the gate withdraws one when it blocks the other, with its own reason.
+
+---
+
+### 4. The other half of §1091
+
+The screen stops a *sale* an earlier purchase would wash. Nothing
+stopped a *purchase* that would wash an earlier sale — the way a
+harvest is most often undone, by the next rebalance quietly buying back
+what was just sold.
+
+`blackout_tickers` names what may not be bought today: anything sold at
+a loss in the last 30 days, plus everything the firm's policy calls
+identical to it. The rebalancer routes around the blackout when topping
+up a sleeve and reports the gap with the rule when it cannot. The gate
+screens buys as well as sells, household-wide:
+
+```
+2024-12-16  taxable-1 harvests a $8,881 VTI loss into SCHB
+2024-12-16  roth-1 review wants to deploy cash into VTI
+            -> unplaced: VTI was sold at a loss within the last 30 days;
+               buying it back would wash that loss (IRC 1091)
+2025-01-15  roth-1 again: still inside the window, still unplaced
+2025-02-17  roth-1 buys VTI
+```
+
+A Roth buying back a loss the taxable account harvested is the Rev. Rul.
+2008-5 case in the buy direction, and the gate cites it as such.
+
+---
+
+### 5. What a reviewer should still notice
+
+The history is more useful for what it still shows than for what it
+hides, so these are left visible:
+
+- Every taxable review with buys proposes a top-up of the client's
+  former-employer stock, and the gate removes it every time with the IPS
+  clause. The rebalancer tracks the model; the IPS decides what is
+  allowed; they are deliberately separate so every rejection names its
+  authority. Reasonable people could want the rebalancer to know.
+- On the final day every remaining loss is shown as **blocked**, because
+  the August rebalance bought those same tickers inside the window. The
+  engine's own buys block its harvests for 30 days. That is correct, and
+  it is a real cost of rebalancing frequently.
+- Harvests cascade in a drawdown: gold into silver, silver back into
+  gold, gold into cash, four months running. Each cleared both
+  thresholds. Whether a firm wants that is a policy question the knobs
+  can answer; the engine does not decide it.
+- The Roth shows a negative cash balance for three days in October 2025,
+  when a fee lands before any contribution. Fees may overdraw by design.
+
+---
+
 ## What is left
 
-Phase 09 — the AI layer (§14 of the plan): rationale narration behind
-the numeric fidelity gate, citation-backed extraction, model calls
-recorded as ledger events. **Needs an Anthropic API key.**
+The AI layer (§14 of the plan): rationale narration behind the numeric
+fidelity gate, citation-backed extraction, model calls recorded as
+ledger events. **Needs an Anthropic API key.**
+
+Also not built, and said so where it matters: a market-holiday calendar
+(settlement is Mon–Fri only), asset location across the household,
+custodian data and reconciliation, persistence beyond the in-memory
+store, and the Phase 09 harvest cadence as a firm policy rather than a
+threshold pair.
