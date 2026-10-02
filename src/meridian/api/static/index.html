@@ -132,7 +132,7 @@
 
 <header>
   <h1>Meridian</h1>
-  <span class="sub">tax-aware rebalancing &middot; every amount on the wire is a string &middot; demo data, your own copy</span>
+  <span class="sub">A tax-aware rebalancing demo. Every amount on the wire is a string, and this copy of the data is yours alone.</span>
 </header>
 
 <main>
@@ -314,8 +314,8 @@ function renderProposal(p) {
       <strong>${esc(p.proposal_id)}</strong>
       <span class="pill ${p.status === "approved" ? "ok" : p.status === "rejected" ? "breach" : "warn"}">
         ${esc(p.status)}</span>
-      <span class="sub">turnover ${esc(p.turnover_display)}
-        &middot; cash after ${esc(p.cash_after_display)}</span>
+      <span class="sub">turnover ${esc(p.turnover_display)},
+        cash after ${esc(p.cash_after_display)}</span>
     </div>
 
     ${trades.length ? `<table>
