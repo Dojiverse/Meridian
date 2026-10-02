@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 from meridian.api.app import create_app
 from meridian.api.demo import build_demo_store
 from meridian.api.store import Store
+from meridian.money import Money
 
 
 @pytest.fixture
@@ -65,6 +66,9 @@ MONETARY_KEYS = {
     "proceeds",
     "gain",
     "realized_gain",
+    "market_value",
+    "unrealized_loss",
+    "tax_benefit",
 }
 """Every field carrying an exact decimal. Shares and weights are here
 too: a quantity of 53.353 and a weight of 0.166667 are values the server
@@ -97,6 +101,10 @@ def _every_response(client: TestClient) -> Iterator[tuple[str, Any]]:
         yield (
             f"POST /api/accounts/{account}/proposals",
             client.post(f"/api/accounts/{account}/proposals").json(),
+        )
+        yield (
+            f"/api/accounts/{account}/harvest",
+            client.get(f"/api/accounts/{account}/harvest").json(),
         )
     yield "/api/audit", client.get("/api/audit").json()
 
@@ -272,18 +280,50 @@ def test_an_approval_without_an_actor_is_refused(client: TestClient) -> None:
     assert response.status_code == 422
 
 
-def test_a_blocked_proposal_cannot_be_approved(client: TestClient) -> None:
-    """Overriding a block is a separate, separately recorded decision —
-    not an approval."""
+def test_a_proposal_with_blocks_is_approved_as_gated(client: TestClient) -> None:
+    """The gate removed the blocked trades and re-checked that the
+    survivors are fundable. Approving the survivors is executing what
+    the gate allowed — not an override — and the record says how many
+    trades were removed."""
     created = client.post("/api/accounts/taxable-1/proposals").json()
     assert not created["is_clear"]
+    assert created["is_approvable"]
+    assert created["blocked"]
 
     response = client.post(
         f"/api/proposals/{created['proposal_id']}/approve",
-        json={"actor": "a.advisor"},
+        json={"actor": "a.advisor", "note": "as gated"},
     )
+    assert response.status_code == 200
+    assert response.json()["status"] == "approved"
+
+    audit = client.get("/api/audit").json()
+    entry = [e for e in audit["entries"] if e["action"] == "proposal.approved"][-1]
+    assert entry["payload"]["executed"] == str(len(created["trades"]))
+    assert entry["payload"]["removed"] == str(len(created["blocked"]))
+
+
+def test_a_proposal_with_nothing_surviving_cannot_be_approved(store: Store) -> None:
+    """When the gate let nothing through there is nothing to approve.
+    Executing a blocked trade would be an override — a separate,
+    separately recorded decision."""
+    from meridian.compliance import ComplianceGate, MinimumCash
+
+    # An account-level block stops every trade.
+    store.accounts["taxable-1"].gate = ComplianceGate(
+        (MinimumCash("ips-6", Money("1000000.00"), authority="IPS clause 6"),)
+    )
+    with TestClient(create_app(store)) as client:
+        created = client.post("/api/accounts/taxable-1/proposals").json()
+        assert not created["is_approvable"]
+        assert created["trades"] == []
+
+        response = client.post(
+            f"/api/proposals/{created['proposal_id']}/approve",
+            json={"actor": "a.advisor"},
+        )
     assert response.status_code == 422
-    assert "blocking violations" in response.json()["detail"]
+    assert "nothing to approve" in response.json()["detail"]
 
 
 def test_a_decision_is_made_once(client: TestClient) -> None:
@@ -497,3 +537,34 @@ def test_roth_sells_carry_no_lots_and_no_gain(client: TestClient) -> None:
     for trade in sells:
         assert trade["lots"] == []
         assert trade["realized_gain"] is None
+
+
+# ============================================================
+# THE HARVEST SCREEN
+# ============================================================
+
+
+def test_the_harvest_screen_shows_the_blocked_gold_loss(client: TestClient) -> None:
+    """The demo's GLD lot is under water, and the Roth bought GLD inside
+    the window. The screen shows the opportunity AND why it cannot be
+    taken, before anyone generates a proposal."""
+    body = client.get("/api/accounts/taxable-1/harvest").json()
+    gold = [h for h in body["opportunities"] if h["ticker"] == "GLD"]
+    assert gold
+    assert gold[0]["is_blocked"]
+    assert "PERMANENTLY FORFEITED" in gold[0]["block_reason"]
+    assert gold[0]["alternatives"] == ["SLV"]
+
+
+def test_a_blocked_harvest_is_not_proposed(client: TestClient) -> None:
+    """The proposal contains no harvest trades for GLD: the screen said
+    it is blocked, and proposing it would be proposing a trade the firm
+    already knows is bad."""
+    body = client.post("/api/accounts/taxable-1/proposals").json()
+    harvests = [t for t in body["trades"] + body["blocked"] if t["harvest"]]
+    assert harvests == []
+
+
+def test_the_roth_has_no_harvest_screen(client: TestClient) -> None:
+    body = client.get("/api/accounts/roth-1/harvest").json()
+    assert body["opportunities"] == []

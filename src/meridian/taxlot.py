@@ -92,6 +92,7 @@ __all__ = [
     "holding_period",
     "is_covered",
     "lot_sort_key",
+    "replay_disposals",
     "select_lots",
     "settlement_date",
 ]
@@ -652,7 +653,34 @@ def build_lots(
     method: LotMethod = LotMethod.FIFO,
     rates: TaxRates | None = None,
 ) -> dict[str, list[TaxLot]]:
-    """Replay a ledger event stream into open tax lots per ticker.
+    """The open lots per ticker after replaying `events`. See `_replay`."""
+    lots, _ = _replay(events, method=method, rates=rates)
+    return lots
+
+
+def replay_disposals(
+    events: Iterable[object],
+    *,
+    method: LotMethod = LotMethod.FIFO,
+    rates: TaxRates | None = None,
+) -> list[Disposal]:
+    """Every disposal realised by `events`, in order. See `_replay`.
+
+    The other half of the fold: `build_lots` says what is still held,
+    this says what was sold and at what gain. Both come from one replay
+    so they cannot disagree about which lot a sale consumed.
+    """
+    _, disposals = _replay(events, method=method, rates=rates)
+    return disposals
+
+
+def _replay(
+    events: Iterable[object],
+    *,
+    method: LotMethod,
+    rates: TaxRates | None,
+) -> tuple[dict[str, list[TaxLot]], list[Disposal]]:
+    """Replay a ledger event stream into open lots and realised disposals.
 
     Buys open lots; sells consume them by `method` — unless the Sell
     names its own lots, in which case THOSE are consumed, by specific
@@ -668,6 +696,7 @@ def build_lots(
     from meridian.ledger import Buy, Sell  # local: avoids a cycle
 
     lots: dict[str, list[TaxLot]] = {}
+    disposals: list[Disposal] = []
 
     for event in events:
         if isinstance(event, Buy):
@@ -702,5 +731,7 @@ def build_lots(
                     rates=rates,
                 )
             lots[event.ticker] = list(result.remaining_lots)
+            disposals.extend(result.disposals)
 
-    return {ticker: open_lots for ticker, open_lots in lots.items() if open_lots}
+    open_lots = {ticker: held for ticker, held in lots.items() if held}
+    return open_lots, disposals

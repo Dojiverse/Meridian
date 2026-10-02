@@ -63,7 +63,7 @@ tests assert.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -245,6 +245,17 @@ class Trade:
     quantities sum to `quantity` exactly. Empty for buys and for sells
     sized without lot data."""
 
+    harvest: bool = False
+    """True for a trade placed to realise a loss (or to replace the
+    exposure a harvest sold), rather than to track the model. Same
+    order, different reason, and the reason is part of the record."""
+
+    pair: str = ""
+    """Ties a harvest sell to its replacement buy. Two legs of one
+    decision: if the gate blocks either, it withdraws both. A harvest
+    whose replacement is blocked but whose sale goes through leaves the
+    client out of the market for a month — worse than not harvesting."""
+
     @property
     def consideration(self) -> Money:
         """What it costs (buy) or raises (sell)."""
@@ -311,13 +322,22 @@ class Proposal:
 
     trigger: str = "none"
     """Why the engine acted: 'band' when a sleeve left its tolerance,
-    'cash' when idle cash alone exceeded the policy's trigger, 'none'
-    for an empty proposal. Recorded so a review can say not just what
-    was traded but what prompted it."""
+    'cash' when idle cash alone exceeded the policy's trigger,
+    'harvest' when only a tax-loss harvest was worth doing, 'none' for
+    an empty proposal. Recorded so a review can say not just what was
+    traded but what prompted it."""
 
     @property
     def is_empty(self) -> bool:
         return not self.trades
+
+    @property
+    def harvests(self) -> tuple[Trade, ...]:
+        return tuple(t for t in self.trades if t.harvest)
+
+    @property
+    def rebalancing_trades(self) -> tuple[Trade, ...]:
+        return tuple(t for t in self.trades if not t.harvest)
 
     @property
     def buys(self) -> tuple[Trade, ...]:
@@ -389,6 +409,7 @@ def generate_proposal(
     policy: RebalancePolicy | None = None,
     lots: Mapping[str, Sequence[TaxLot]] | None = None,
     rates: TaxRates | None = None,
+    blackout: Collection[str] = frozenset(),
 ) -> Proposal:
     """Produce the trades that bring `portfolio` back toward `model`.
 
@@ -399,6 +420,10 @@ def generate_proposal(
             None for a tax-advantaged account, where lot choice has no
             tax consequence and proportional selling is fine.
         rates: The client's marginal rates. Required by MIN_TAX.
+        blackout: Tickers that must not be bought today because buying
+            them would wash a loss realised in the last 30 days — see
+            `washsale.blackout_tickers`. A sleeve whose every candidate
+            is blacked out reports the gap rather than buying anyway.
 
     Returns an empty proposal — not an error — when no band is breached.
     "Nothing to do" is a valid and common answer, and a rebalancer that
@@ -501,6 +526,7 @@ def generate_proposal(
                 classification,
                 model,
                 policy,
+                blackout,
                 trades,
                 unplaced,
             )
@@ -898,10 +924,18 @@ def _plan_buys(
     classification: Mapping[str, str],
     model: Model,
     policy: RebalancePolicy,
+    blackout: Collection[str],
     trades: list[Trade],
     unplaced: list[Unplaced],
 ) -> Money:
-    """Deploy up to `amount` into `sleeve`. Returns what was actually spent."""
+    """Deploy up to `amount` into `sleeve`. Returns what was actually spent.
+
+    Nothing in `blackout` is bought. A harvest sold those securities at
+    a loss within the last 30 days, and buying them back — even in
+    proportion to what is still held — would wash the loss the firm
+    just took. The sleeve is topped up through its other holdings, or
+    the model's named security, or reported as unplaced.
+    """
     if available <= Money.zero():
         _record_unplaced(unplaced, sleeve, amount, "no cash available", policy)
         return Money.zero()
@@ -923,7 +957,9 @@ def _plan_buys(
     existing = {
         ticker: value
         for ticker, value in ticker_values.items()
-        if classification.get(ticker) == sleeve and not value.is_zero
+        if classification.get(ticker) == sleeve
+        and not value.is_zero
+        and ticker not in blackout
     }
 
     if existing:
@@ -939,12 +975,23 @@ def _plan_buys(
         # authority to make.
         sleeve_def = model.sleeve_of(sleeve)
         security = sleeve_def.security if sleeve_def else None
+        if security is not None and security in blackout:
+            _record_unplaced(
+                unplaced,
+                sleeve,
+                amount,
+                f"{security} was sold at a loss within the last 30 days; buying "
+                "it back would wash that loss (IRC 1091)",
+                policy,
+            )
+            return Money.zero()
         if security is None:
             _record_unplaced(
                 unplaced,
                 sleeve,
                 amount,
-                "sleeve holds nothing and the model names no security to buy",
+                "sleeve holds nothing it may buy and the model names no "
+                "security to buy",
                 policy,
             )
             return Money.zero()

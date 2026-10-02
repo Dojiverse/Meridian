@@ -23,8 +23,8 @@ from meridian.audit import Action
 from meridian.ledger import fold
 from meridian.money import Money
 from meridian.showcase.history import History, build_history
-from meridian.showcase.snapshots import _disposals_through, render, snapshot_dates
-from meridian.taxlot import build_lots
+from meridian.showcase.snapshots import render, snapshot_dates
+from meridian.taxlot import build_lots, replay_disposals
 from meridian.washsale import find_wash_sales
 
 
@@ -93,6 +93,7 @@ INTEGER_KEYS = {
     "approved_reviews",
     "rejected_reviews",
     "no_action_reviews",
+    "harvest_reviews",
 }
 """The only JSON numbers allowed: counts and sequence numbers, which
 are exact as integers, plus the charting integers ending in _cents or
@@ -172,7 +173,7 @@ def test_the_gate_prevented_every_wash_sale(history: History) -> None:
     running over everything that actually happened."""
     taxable = history.accounts["taxable-1"]
     report = find_wash_sales(
-        _disposals_through(taxable.events),
+        replay_disposals(taxable.events),
         history.household_acquisitions_through(history.today),
         history.substitutes,
     )
@@ -266,11 +267,18 @@ def test_sells_choose_lots_across_the_whole_sleeve(history: History) -> None:
         r
         for r in history.reviews
         if r.account_id == "taxable-1"
-        and len({t.ticker for t in r.compliance.passed if t.sleeve == "equity"}) > 1
+        and len(
+            {
+                t.ticker
+                for t in r.compliance.passed
+                if t.sleeve == "equity" and t.side.value == "sell" and not t.harvest
+            }
+        )
+        > 1
     ]
     assert multi
     for trade in multi[0].compliance.passed:
-        if trade.sleeve == "equity":
+        if trade.sleeve == "equity" and trade.side.value == "sell":
             assert trade.lots
 
 
@@ -304,3 +312,55 @@ def test_gips_refusal_is_visible_in_the_first_year(document: dict[str, Any]) -> 
 def test_the_document_says_it_is_synthetic(document: dict[str, Any]) -> None:
     assert document["meta"]["synthetic"] is True
     assert "not market data" in document["meta"]["note"]
+
+
+# ============================================================
+# HARVESTING AND THE BLACKOUT
+# ============================================================
+
+
+def test_losses_are_harvested_and_replaced(history: History) -> None:
+    """At least one review is a pure harvest: a lot-identified sell at a
+    loss paired with a buy of the firm's alternative, same sleeve."""
+    harvests = [
+        r
+        for r in history.reviews
+        if r.status == "approved" and r.proposal.trigger == "harvest"
+    ]
+    assert harvests
+    first = harvests[0]
+    sells = [t for t in first.compliance.passed if t.side.value == "sell" and t.harvest]
+    buys = [t for t in first.compliance.passed if t.side.value == "buy" and t.harvest]
+    assert sells and buys
+    assert sells[0].pair == buys[0].pair
+    assert sells[0].sleeve == buys[0].sleeve
+    assert sells[0].realized_gain is not None and sells[0].realized_gain.is_negative
+
+
+def test_the_blackout_reaches_across_the_household(history: History) -> None:
+    """After the taxable account harvests a VTI loss, the Roth's next
+    review wants to buy VTI and may not. The gap is reported with the
+    rule rather than quietly filled."""
+    gaps = [
+        (r, u)
+        for r in history.reviews
+        if r.account_id == "roth-1"
+        for u in r.proposal.unplaced
+        if "IRC 1091" in u.reason
+    ]
+    assert gaps
+    _review, gap = gaps[0]
+    assert gap.sleeve == "equity"
+    assert "VTI" in gap.reason
+
+
+def test_no_harvest_leg_executed_alone(history: History) -> None:
+    """Every executed harvest sell has its replacement buy in the same
+    review, or no replacement was designated — never a replacement
+    that was blocked while the sell went through."""
+    for review in history.reviews:
+        if review.status != "approved":
+            continue
+        executed = {t.pair for t in review.compliance.passed if t.pair}
+        blocked = {t.pair for t in review.compliance.blocked if t.pair}
+        assert not (executed & blocked)

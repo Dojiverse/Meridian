@@ -39,7 +39,7 @@ from meridian.ledger import LedgerEvent, Portfolio, fold
 from meridian.model import Model
 from meridian.money import Price
 from meridian.rebalance import Proposal
-from meridian.taxlot import TaxLot, TaxRates, build_lots
+from meridian.taxlot import Disposal, TaxLot, TaxRates, build_lots, replay_disposals
 from meridian.washsale import Acquisition, SubstituteMap
 
 __all__ = ["AccountState", "Store", "StoredProposal"]
@@ -89,6 +89,10 @@ class AccountState:
 
     def lots(self) -> dict[str, list[TaxLot]]:
         return build_lots(self.events)
+
+    def disposals(self) -> list[Disposal]:
+        """Every realised sale, from the same replay that builds lots."""
+        return replay_disposals(self.events)
 
     def acquisitions(self) -> list[Acquisition]:
         """Purchases in THIS account. See Store.household_acquisitions —
@@ -160,3 +164,20 @@ class Store:
             if state.household_id == household:
                 acquisitions.extend(state.acquisitions())
         return acquisitions
+
+    def household_disposals(self, account_id: str) -> list[Disposal]:
+        """Every realised sale in the household's TAXABLE accounts.
+
+        The buy-side wash screen: a purchase today, in any account, that
+        would wash a loss one of these sales realised. Losses inside an
+        IRA are nobody's deduction, so those accounts contribute none.
+        """
+        household = self.account(account_id).household_id
+        disposals: list[Disposal] = []
+        for state in self.accounts.values():
+            if (
+                state.household_id == household
+                and not state.account.account_type.is_tax_advantaged
+            ):
+                disposals.extend(state.disposals())
+        return disposals

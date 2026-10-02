@@ -25,8 +25,20 @@ from meridian.household import AccountType
 from meridian.ledger import Buy, Deposit, LedgerEvent, fold
 from meridian.model import Model, Sleeve
 from meridian.money import Money, Price, Shares, Weight
-from meridian.rebalance import RebalancePolicy, Side, generate_proposal
-from meridian.taxlot import LotMethod, TaxLot, TaxRates, build_lots
+from meridian.rebalance import (
+    RebalancePolicy,
+    Side,
+    Trade,
+    generate_proposal,
+)
+from meridian.taxlot import (
+    Disposal,
+    HoldingPeriod,
+    LotMethod,
+    TaxLot,
+    TaxRates,
+    build_lots,
+)
 from meridian.washsale import Acquisition, SubstituteMap
 
 D = date(2026, 9, 8)
@@ -72,6 +84,8 @@ def context(
     policy: RebalancePolicy | None = None,
     lot_aware: bool = False,
     rates: TaxRates | None = None,
+    disposals: list[Disposal] | None = None,
+    extra_trades: tuple[Trade, ...] = (),
 ) -> ComplianceContext:
     stream = events or DRIFTED
     portfolio = fold(stream)
@@ -85,6 +99,10 @@ def context(
         lots=build_lots(stream) if lot_aware else None,
         rates=rates,
     )
+    if extra_trades:
+        from dataclasses import replace
+
+        proposal = replace(proposal, trades=(*proposal.trades, *extra_trades))
     return ComplianceContext(
         proposal=proposal,
         portfolio=portfolio,
@@ -95,6 +113,7 @@ def context(
         lots=lots or {},
         acquisitions=acquisitions or [],
         substitutes=substitutes,
+        disposals=disposals or [],
     )
 
 
@@ -551,3 +570,167 @@ def test_the_gate_uses_the_named_lots_not_a_fifo_guess() -> None:
         )
     )
     assert not oldest_first.warnings
+
+
+# ============================================================
+# THE BUY SIDE OF SECTION 1091
+# ============================================================
+
+
+def recent_gold_loss() -> Disposal:
+    """GLD sold at a loss twelve days ago."""
+    return Disposal(
+        "GLD-1",
+        "GLD",
+        date(2024, 1, 2),
+        D.replace(day=D.day - 12) if D.day > 12 else D,
+        Shares("50"),
+        Money("7500.00"),
+        Money("10000.00"),
+        HoldingPeriod.LONG,
+        True,
+    )
+
+
+def a_gold_buy() -> Trade:
+    return Trade("GLD", Side.BUY, Shares("10"), PRICES["GLD"], "alt", "test buy")
+
+
+def test_buying_back_a_harvested_loss_is_blocked() -> None:
+    """The most common way a harvest is undone: the next rebalance buys
+    what was just sold. In a taxable account the loss would be deferred
+    — and the harvest undone, which nobody intended."""
+    result = gate(WashSaleBlock("wash")).evaluate(
+        context(
+            substitutes=POLICY,
+            disposals=[recent_gold_loss()],
+            extra_trades=(a_gold_buy(),),
+        )
+    )
+    gold = [
+        v for v in result.blocks if v.subject == "GLD" and v.constraint_id == "wash"
+    ]
+    assert gold
+    assert "buying GLD would wash" in gold[0].message
+    assert gold[0].authority == "IRC 1091"
+
+
+def test_buying_the_identical_substitute_is_blocked_too() -> None:
+    """IAU is policy-identical to GLD. Buying it after a GLD loss is the
+    same wash sale under a different ticker."""
+    iau = Trade("IAU", Side.BUY, Shares("10"), Price("30.00"), "alt", "test buy")
+    result = gate(WashSaleBlock("wash")).evaluate(
+        context(
+            substitutes=POLICY,
+            disposals=[recent_gold_loss()],
+            extra_trades=(iau,),
+        )
+    )
+    assert any(v.subject == "IAU" and v.constraint_id == "wash" for v in result.blocks)
+
+
+def test_a_roth_buying_back_the_loss_cites_the_forfeiture() -> None:
+    """Household scope in the buy direction. The Roth buying gold two
+    weeks after the taxable account harvested a gold loss is exactly
+    the Rev. Rul. 2008-5 case."""
+    result = gate(WashSaleBlock("wash")).evaluate(
+        context(
+            substitutes=POLICY,
+            account_type=AccountType.ROTH_IRA,
+            disposals=[recent_gold_loss()],
+            extra_trades=(a_gold_buy(),),
+        )
+    )
+    gold = [
+        v for v in result.blocks if v.subject == "GLD" and v.constraint_id == "wash"
+    ]
+    assert gold
+    assert "PERMANENTLY FORFEITED" in gold[0].message
+    assert gold[0].authority == "Rev. Rul. 2008-5"
+
+
+def test_an_old_loss_imposes_no_block() -> None:
+    old = Disposal(
+        "GLD-1",
+        "GLD",
+        date(2024, 1, 2),
+        date(2026, 1, 5),
+        Shares("50"),
+        Money("7500.00"),
+        Money("10000.00"),
+        HoldingPeriod.LONG,
+        True,
+    )
+    result = gate(WashSaleBlock("wash")).evaluate(
+        context(substitutes=POLICY, disposals=[old], extra_trades=(a_gold_buy(),))
+    )
+    assert not any(
+        v.subject == "GLD" and v.constraint_id == "wash" for v in result.blocks
+    )
+
+
+# ============================================================
+# A HARVEST IS ONE DECISION WITH TWO LEGS
+# ============================================================
+
+
+def test_blocking_one_leg_of_a_harvest_withdraws_the_other() -> None:
+    """The replacement buy is on the restricted list. Executing the sell
+    alone would leave the client out of the market for a month on a
+    position the firm meant to keep — so the sell is withdrawn too,
+    with its own reason."""
+    sell = Trade(
+        "GLD",
+        Side.SELL,
+        Shares("10"),
+        PRICES["GLD"],
+        "alt",
+        "harvest",
+        harvest=True,
+        pair="gld-1",
+    )
+    buy = Trade(
+        "SLV",
+        Side.BUY,
+        Shares("50"),
+        Price("27.00"),
+        "alt",
+        "harvest",
+        harvest=True,
+        pair="gld-1",
+    )
+    result = gate(
+        RestrictedSecurity("ips-9", frozenset({"SLV"}), "no silver", "IPS 9")
+    ).evaluate(context(extra_trades=(sell, buy)))
+
+    blocked = {t.ticker for t in result.blocked}
+    assert {"GLD", "SLV"} <= blocked
+    withdrawn = [v for v in result.blocks if v.constraint_id == "harvest-pair"]
+    assert withdrawn and withdrawn[0].subject == "GLD"
+    assert "withdrawn" in withdrawn[0].message
+
+
+def test_an_intact_harvest_pair_passes_together() -> None:
+    sell = Trade(
+        "GLD",
+        Side.SELL,
+        Shares("10"),
+        PRICES["GLD"],
+        "alt",
+        "harvest",
+        harvest=True,
+        pair="gld-1",
+    )
+    buy = Trade(
+        "SLV",
+        Side.BUY,
+        Shares("50"),
+        Price("27.00"),
+        "alt",
+        "harvest",
+        harvest=True,
+        pair="gld-1",
+    )
+    result = gate().evaluate(context(extra_trades=(sell, buy)))
+    passed = {t.ticker for t in result.passed}
+    assert {"GLD", "SLV"} <= passed

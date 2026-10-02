@@ -26,6 +26,7 @@ could forget to.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -38,6 +39,8 @@ from meridian.api.schemas import (
     AuditEntryOut,
     AuditOut,
     DriftOut,
+    HarvestOut,
+    HarvestScreenOut,
     ProposalOut,
     RejectRequest,
 )
@@ -45,10 +48,12 @@ from meridian.api.store import AccountState, Store, StoredProposal
 from meridian.audit import Action
 from meridian.compliance import ComplianceContext, Severity
 from meridian.drift import compute_drift, group_values
+from meridian.harvest import add_harvest, harvest_trades
 from meridian.ledger import LedgerError, market_values
 from meridian.model import ModelError
 from meridian.rebalance import generate_proposal
-from meridian.taxlot import LotError
+from meridian.taxlot import Disposal, LotError
+from meridian.washsale import blackout_tickers, find_harvest_opportunities
 
 STATIC = Path(__file__).parent / "static"
 
@@ -188,6 +193,9 @@ def create_app(store: Store) -> FastAPI:
         state = _require_account(account_id)
         portfolio = state.portfolio()
         lots = state.lots()
+        acquisitions = store.household_acquisitions(account_id)
+        disposals = store.household_disposals(account_id)
+        blackout = _blackout(state, disposals)
 
         # Lot-aware sells only where lots have a tax consequence. Inside
         # a Roth every lot costs the same to sell — nothing — so the
@@ -201,7 +209,31 @@ def create_app(store: Store) -> FastAPI:
             on=store.today,
             lots=lots if taxable else None,
             rates=state.rates if taxable else None,
+            blackout=blackout,
         )
+
+        # Harvest what the screen finds, in the same proposal, so there
+        # is one gate run and one approval.
+        if taxable and state.rates is not None and state.substitutes is not None:
+            proposal = add_harvest(
+                proposal,
+                harvest_trades(
+                    lots,
+                    store.prices,
+                    acquisitions,
+                    state.substitutes,
+                    state.rates,
+                    state.classification,
+                    on=store.today,
+                    account_id=account_id,
+                    account_type=state.account.account_type,
+                    blackout=blackout,
+                    exclude_lot_ids={
+                        sel.lot_id for t in proposal.sells for sel in t.lots
+                    },
+                    exclude_tickers={t.ticker for t in proposal.buys},
+                ),
+            )
 
         context = ComplianceContext(
             proposal=proposal,
@@ -213,8 +245,9 @@ def create_app(store: Store) -> FastAPI:
             lots=lots,
             # Household scope, not account scope — see
             # Store.household_acquisitions.
-            acquisitions=store.household_acquisitions(account_id),
+            acquisitions=acquisitions,
             substitutes=state.substitutes,
+            disposals=disposals,
         )
         compliance = state.gate.evaluate(context)
 
@@ -268,13 +301,17 @@ def create_app(store: Store) -> FastAPI:
                     "so the record of what was approved stays true."
                 ),
             )
-        if not stored.compliance.is_clear:
+        if not stored.compliance.passed:
+            # Approval executes the trades the gate let through. When it
+            # let none through there is nothing to approve. Executing a
+            # BLOCKED trade would be an override — a separate, separately
+            # recorded decision — and this endpoint never does that.
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "this proposal has blocking violations and cannot be "
-                    "approved. Overriding a block is a separate, separately "
-                    "recorded decision — not an approval."
+                    "nothing in this proposal survived the compliance gate, so "
+                    "there is nothing to approve. Overriding a block is a "
+                    "separate, separately recorded decision — not an approval."
                 ),
             )
 
@@ -292,9 +329,56 @@ def create_app(store: Store) -> FastAPI:
             Action.PROPOSAL_APPROVED,
             proposal_id,
             account_id=stored.account_id,
+            # What was approved is the GATED list. The record says how
+            # many trades the gate removed, so "approved" can never be
+            # read as "approved everything that was proposed".
+            executed=str(len(stored.compliance.passed)),
+            removed=str(len(stored.compliance.blocked)),
             note=request.note,
         )
         return _render(store.proposals[proposal_id])
+
+    # ---- harvest --------------------------------------------------
+
+    @app.get("/api/accounts/{account_id}/harvest", response_model=HarvestScreenOut)
+    def harvest_screen(account_id: str) -> HarvestScreenOut:
+        """Lots at a loss, which may be taken, and what may not be bought.
+
+        The screen, not the trade. Generating a proposal is what acts
+        on it; this is for seeing why a harvest was or was not proposed.
+        """
+        state = _require_account(account_id)
+        disposals = store.household_disposals(account_id)
+        blackout = _blackout(state, disposals)
+
+        if (
+            state.account.account_type.is_tax_advantaged
+            or state.rates is None
+            or state.substitutes is None
+        ):
+            return HarvestScreenOut(
+                account_id=account_id,
+                opportunities=(),
+                blackout=tuple(sorted(blackout)),
+            )
+
+        lots = state.lots()
+        flat = [lot for ticker in sorted(lots) for lot in lots[ticker]]
+        found = find_harvest_opportunities(
+            flat,
+            store.prices,
+            store.household_acquisitions(account_id),
+            state.substitutes,
+            state.rates,
+            on=store.today,
+            account_id=account_id,
+            account_type=state.account.account_type,
+        )
+        return HarvestScreenOut(
+            account_id=account_id,
+            opportunities=tuple(HarvestOut.of(h) for h in found),
+            blackout=tuple(sorted(blackout)),
+        )
 
     @app.post("/api/proposals/{proposal_id}/reject", response_model=ProposalOut)
     def reject(proposal_id: str, request: RejectRequest) -> ProposalOut:
@@ -359,6 +443,12 @@ def create_app(store: Store) -> FastAPI:
             raise HTTPException(
                 status_code=404, detail=f"no account {account_id!r}"
             ) from None
+
+    def _blackout(state: AccountState, disposals: Sequence[Disposal]) -> frozenset[str]:
+        """What may not be bought today — see washsale.blackout_tickers."""
+        if state.substitutes is None:
+            return frozenset()
+        return blackout_tickers(disposals, state.substitutes, on=store.today)
 
     def _require_proposal(proposal_id: str) -> StoredProposal:
         stored = store.proposals.get(proposal_id)

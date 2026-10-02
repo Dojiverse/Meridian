@@ -61,6 +61,7 @@ from meridian.compliance import (
     ShortTermGainLimit,
     WashSaleBlock,
 )
+from meridian.harvest import HarvestPolicy, add_harvest, harvest_trades
 from meridian.household import Account, AccountType, Household
 from meridian.ledger import (
     Buy,
@@ -83,8 +84,8 @@ from meridian.rebalance import (
     generate_proposal,
 )
 from meridian.showcase.prices import PriceBook, build_prices
-from meridian.taxlot import TaxLot, TaxRates, build_lots
-from meridian.washsale import Acquisition, SubstituteMap
+from meridian.taxlot import Disposal, TaxLot, TaxRates, build_lots, replay_disposals
+from meridian.washsale import Acquisition, SubstituteMap, blackout_tickers
 
 __all__ = [
     "AccountHistory",
@@ -106,10 +107,14 @@ TODAY = date(2026, 9, 8)
 CLASSIFICATION: Mapping[str, str] = {
     "VTI": "equity",
     "AAPL": "equity",
+    "SCHB": "equity",
     "BND": "bond",
     "GLD": "alt",
     "IAU": "alt",
+    "SLV": "alt",
 }
+"""The harvest alternatives are classified into the sleeves they
+replace, or the next review would sell them as untargeted."""
 
 CLASSIC = Model(
     model_id="classic-60-40",
@@ -139,8 +144,15 @@ purchase still counts as a replacement for section 1091."""
 
 SUBSTITUTES = SubstituteMap.symmetric(
     groups=[["GLD", "IAU"], ["VTI", "ITOT"]],
-    alternatives={"GLD": ("SLV",), "VTI": ("SCHB",)},
+    alternatives={
+        "GLD": ("SLV",),
+        "SLV": ("GLD",),
+        "VTI": ("SCHB",),
+        "SCHB": ("VTI",),
+    },
 )
+"""Alternatives run both ways so a harvested replacement can itself be
+harvested back into the original once the window has closed."""
 
 HIGH_BRACKET = TaxRates(
     short_term=Weight("0.37"), long_term=Weight("0.20"), niit=Weight("0.038")
@@ -156,6 +168,10 @@ POLICY = RebalancePolicy(cash_trigger=Weight("0.02"))
 """Band-edge targets, min-tax lots, and act when idle cash passes 2%.
 The same policy at every review, so a difference between two reviews
 is a difference in the account, not in the knobs."""
+
+HARVEST = HarvestPolicy(minimum_loss=Money("500.00"))
+"""Harvest any lot more than $500 under water, replacing the exposure
+with the firm's designated alternative."""
 REVIEW_TIME = time(20, 30)
 """15:30 Eastern, stored as UTC. The audit log refuses naive timestamps."""
 
@@ -204,6 +220,9 @@ class AccountHistory:
     def lots_on(self, day: date) -> dict[str, list[TaxLot]]:
         return build_lots(self.events_through(day))
 
+    def disposals_through(self, day: date) -> list[Disposal]:
+        return replay_disposals(self.events_through(day))
+
     def acquisitions_through(self, day: date) -> list[Acquisition]:
         return [
             Acquisition(
@@ -237,6 +256,15 @@ class History:
         found: list[Acquisition] = []
         for state in self.accounts.values():
             found.extend(state.acquisitions_through(day))
+        return found
+
+    def household_disposals_through(self, day: date) -> list[Disposal]:
+        """Realised sales in the household's taxable accounts — the
+        losses a purchase anywhere in the household could wash."""
+        found: list[Disposal] = []
+        for state in self.accounts.values():
+            if not state.account.account_type.is_tax_advantaged:
+                found.extend(state.disposals_through(day))
         return found
 
     def review_dates(self) -> list[date]:
@@ -353,6 +381,9 @@ class _Reviewer:
         portfolio = state.portfolio_on(day)
         lots = state.lots_on(day)
         taxable = not state.account.account_type.is_tax_advantaged
+        acquisitions = history.household_acquisitions_through(day)
+        disposals = history.household_disposals_through(day)
+        blackout = blackout_tickers(disposals, history.substitutes, on=day)
 
         proposal = generate_proposal(
             portfolio,
@@ -363,7 +394,29 @@ class _Reviewer:
             policy=POLICY,
             lots=lots if taxable else None,
             rates=state.rates if taxable else None,
+            blackout=blackout,
         )
+        if taxable and state.rates is not None:
+            proposal = add_harvest(
+                proposal,
+                harvest_trades(
+                    lots,
+                    prices,
+                    acquisitions,
+                    history.substitutes,
+                    state.rates,
+                    history.classification,
+                    on=day,
+                    account_id=state.account.account_id,
+                    account_type=state.account.account_type,
+                    policy=HARVEST,
+                    blackout=blackout,
+                    exclude_lot_ids={
+                        sel.lot_id for t in proposal.sells for sel in t.lots
+                    },
+                    exclude_tickers={t.ticker for t in proposal.buys},
+                ),
+            )
         compliance = state.gate.evaluate(
             ComplianceContext(
                 proposal=proposal,
@@ -373,8 +426,9 @@ class _Reviewer:
                 account_id=state.account.account_id,
                 account_type=state.account.account_type,
                 lots=lots,
-                acquisitions=history.household_acquisitions_through(day),
+                acquisitions=acquisitions,
                 substitutes=history.substitutes,
+                disposals=disposals,
             )
         )
 
@@ -461,6 +515,7 @@ class _Reviewer:
         )
 
         events = _events_for(compliance.passed, day, state.next_seq())
+        purpose_of = _purposes(compliance.passed, events)
         seqs: list[int] = []
         for event in events:
             state.events.append(event)
@@ -474,6 +529,7 @@ class _Reviewer:
                 seq=str(event.seq),
                 ticker=ticker,
                 side=type(event).__name__.lower(),
+                purpose=purpose_of.get(event.seq, "rebalance"),
                 when=time(20, 31),
             )
             self._audit(
@@ -515,6 +571,18 @@ class _Reviewer:
             payload=payload,
             occurred_at=_at(day, when),
         )
+
+
+def _purposes(trades: Sequence[Trade], events: Sequence[LedgerEvent]) -> dict[int, str]:
+    """Which ledger event came from a harvest trade. Same ordering as
+    `_events_for`, sells first then buys."""
+    ordered = [t for t in trades if t.side is Side.SELL] + [
+        t for t in trades if t.side is Side.BUY
+    ]
+    return {
+        event.seq: "harvest" if trade.harvest else "rebalance"
+        for trade, event in zip(ordered, events, strict=True)
+    }
 
 
 def _events_for(
@@ -575,7 +643,10 @@ def build_history(start: date = START, today: date = TODAY) -> History:
                     constraint_id="ips-3.1",
                     limit=Weight("0.40"),
                     authority="IPS clause 3.1",
-                    exempt=frozenset({"VTI", "BND"}),
+                    # Broad-market funds, including the harvest
+                    # alternative for VTI. A 60% position in a total
+                    # market index is not a concentration.
+                    exempt=frozenset({"VTI", "SCHB", "BND"}),
                 ),
                 MinimumCash(
                     constraint_id="ips-6",

@@ -841,3 +841,56 @@ def test_cash_triggered_proposals_are_applicable(events: list[LedgerEvent]) -> N
     proposal = propose(events, policy)
     after = fold([*events, *proposal.to_events(1000)])
     assert after.total_value(PRICES) == before.total_value(PRICES)
+
+
+# ============================================================
+# THE BLACKOUT
+# ============================================================
+
+
+def test_a_blacked_out_holding_is_not_topped_up() -> None:
+    """Equity holds VTI and AAPL. VTI was sold at a loss within 30 days,
+    so the top-up goes entirely to AAPL."""
+    with_cash: list[LedgerEvent] = [
+        Deposit(1, D, Money("110000.00")),
+        Buy(2, D, "VTI", Shares("300"), Price("140.00")),  # 42,000
+        Buy(3, D, "AAPL", Shares("100"), Price("180.00")),  # 18,000
+        Buy(4, D, "BND", Shares("500"), Price("50.00")),  # 25,000
+        Buy(5, D, "GLD", Shares("100"), Price("150.00")),  # 15,000
+    ]
+    proposal = generate_proposal(
+        fold(with_cash),
+        PRICES,
+        MODEL,
+        CLASSIFICATION,
+        on=D,
+        policy=RebalancePolicy(cash_trigger=Weight("0.02")),
+        blackout={"VTI"},
+    )
+    bought = {t.ticker for t in proposal.buys}
+    assert "VTI" not in bought
+    assert "AAPL" in bought
+
+
+def test_a_sleeve_with_every_candidate_blacked_out_reports_the_gap() -> None:
+    """Equity holds only VTI, the model names VTI, and VTI is blacked
+    out. Buying it anyway would wash the loss; the gap is reported with
+    the reason instead."""
+    with_cash: list[LedgerEvent] = [
+        Deposit(1, D, Money("110000.00")),
+        Buy(2, D, "VTI", Shares("300"), Price("140.00")),
+        Buy(3, D, "BND", Shares("500"), Price("50.00")),
+        Buy(4, D, "GLD", Shares("100"), Price("150.00")),
+    ]
+    proposal = generate_proposal(
+        fold(with_cash),
+        PRICES,
+        MODEL,
+        CLASSIFICATION,
+        on=D,
+        policy=RebalancePolicy(cash_trigger=Weight("0.02")),
+        blackout={"VTI"},
+    )
+    assert not any(t.ticker == "VTI" for t in proposal.buys)
+    gap = [u for u in proposal.unplaced if u.sleeve == "equity"]
+    assert gap and "IRC 1091" in gap[0].reason

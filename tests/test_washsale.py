@@ -22,6 +22,7 @@ from meridian.washsale import (
     MatchOutcome,
     SubstituteMap,
     apply_basis_adjustment,
+    blackout_tickers,
     find_harvest_opportunities,
     find_wash_sales,
     wash_sale_window,
@@ -739,3 +740,197 @@ def test_the_block_reason_names_the_worst_blocker_not_the_first() -> None:
     )
     assert "PERMANENTLY FORFEITED" in opportunity.block_reason
     assert "roth-1" in opportunity.block_reason
+
+
+# ============================================================
+# A LOT IS NOT ITS OWN REPLACEMENT
+# ============================================================
+
+
+def test_the_screen_does_not_count_the_lot_being_sold() -> None:
+    """Bought 20 November, sold 15 December. The purchase is inside the
+    window, but it created the lot being sold — those shares are not
+    replacements for themselves."""
+    own = Acquisition(
+        "t:GLD-5",
+        "taxable-1",
+        AccountType.TAXABLE,
+        "GLD",
+        date(2025, 11, 20),
+        Shares("100"),
+    )
+    clear = would_trigger_wash_sale(
+        "GLD",
+        date(2025, 12, 15),
+        [own],
+        POLICY,
+        account_id="taxable-1",
+        selling=[(date(2025, 11, 20), Shares("100"))],
+    )
+    assert clear == ()
+
+
+def test_excess_shares_bought_the_same_day_still_wash() -> None:
+    """Bought 100 on 20 November, sell 60 of them on 15 December. The
+    other 40 were acquired in the window and are still held: they ARE
+    replacements, for 40 of the 60 sold."""
+    own = Acquisition(
+        "t:GLD-5",
+        "taxable-1",
+        AccountType.TAXABLE,
+        "GLD",
+        date(2025, 11, 20),
+        Shares("100"),
+    )
+    blockers = would_trigger_wash_sale(
+        "GLD",
+        date(2025, 12, 15),
+        [own],
+        POLICY,
+        account_id="taxable-1",
+        selling=[(date(2025, 11, 20), Shares("60"))],
+    )
+    assert len(blockers) == 1
+    assert blockers[0].quantity == Shares("40")
+
+
+def test_a_same_day_purchase_in_another_account_is_not_netted() -> None:
+    """The netting is account-aware. The Roth buying the same ticker on
+    the same day as the taxable lot is a different purchase, and it is
+    a replacement."""
+    roth = Acquisition(
+        "r:GLD-1",
+        "roth-1",
+        AccountType.ROTH_IRA,
+        "GLD",
+        date(2025, 11, 20),
+        Shares("100"),
+    )
+    blockers = would_trigger_wash_sale(
+        "GLD",
+        date(2025, 12, 15),
+        [roth],
+        POLICY,
+        account_id="taxable-1",
+        selling=[(date(2025, 11, 20), Shares("100"))],
+    )
+    assert blockers == (roth,)
+
+
+def test_the_detector_applies_rev_rul_56_602() -> None:
+    """Sell an old lot and a recently bought lot on the same day, both at
+    a loss. The recent purchase is inside the window, but its shares
+    went out in the same sale — nothing was replaced, so no wash."""
+    old = Disposal(
+        "GLD-1",
+        "GLD",
+        date(2024, 1, 2),
+        date(2026, 4, 15),
+        Shares("25"),
+        Money("3750.00"),
+        Money("5000.00"),
+        HoldingPeriod.LONG,
+        True,
+    )
+    recent = Disposal(
+        "GLD-9",
+        "GLD",
+        date(2026, 3, 17),
+        date(2026, 4, 15),
+        Shares("1"),
+        Money("150.00"),
+        Money("165.00"),
+        HoldingPeriod.SHORT,
+        True,
+    )
+    recent_purchase = Acquisition(
+        "t:GLD-9",
+        "taxable-1",
+        AccountType.TAXABLE,
+        "GLD",
+        date(2026, 3, 17),
+        Shares("1"),
+    )
+    report = find_wash_sales([old, recent], [recent_purchase], POLICY)
+    assert not report.findings
+
+
+def test_the_detector_still_catches_a_recent_lot_that_is_kept() -> None:
+    """Same facts, but the recent lot is NOT sold. Now those shares are
+    held after the loss sale, and they are replacements."""
+    old = Disposal(
+        "GLD-1",
+        "GLD",
+        date(2024, 1, 2),
+        date(2026, 4, 15),
+        Shares("25"),
+        Money("3750.00"),
+        Money("5000.00"),
+        HoldingPeriod.LONG,
+        True,
+    )
+    recent_purchase = Acquisition(
+        "t:GLD-9",
+        "taxable-1",
+        AccountType.TAXABLE,
+        "GLD",
+        date(2026, 3, 17),
+        Shares("1"),
+    )
+    report = find_wash_sales([old], [recent_purchase], POLICY)
+    assert len(report.findings) == 1
+    assert report.findings[0].matched == Shares("1")
+
+
+# ============================================================
+# THE BLACKOUT — the buy side of section 1091
+# ============================================================
+
+
+GOLD = SubstituteMap.symmetric(groups=[["GLD", "IAU"]])
+
+
+def test_blackout_covers_the_loss_and_its_identical_substitutes() -> None:
+    loss = Disposal(
+        "GLD-1",
+        "GLD",
+        date(2024, 1, 2),
+        date(2026, 2, 16),
+        Shares("10"),
+        Money("1500.00"),
+        Money("2000.00"),
+        HoldingPeriod.LONG,
+        True,
+    )
+    assert blackout_tickers([loss], GOLD, on=date(2026, 3, 1)) == {"GLD", "IAU"}
+
+
+def test_blackout_ends_after_thirty_days() -> None:
+    loss = Disposal(
+        "GLD-1",
+        "GLD",
+        date(2024, 1, 2),
+        date(2026, 2, 16),
+        Shares("10"),
+        Money("1500.00"),
+        Money("2000.00"),
+        HoldingPeriod.LONG,
+        True,
+    )
+    assert blackout_tickers([loss], GOLD, on=date(2026, 3, 18)) == {"GLD", "IAU"}
+    assert blackout_tickers([loss], GOLD, on=date(2026, 3, 19)) == frozenset()
+
+
+def test_a_gain_imposes_no_blackout() -> None:
+    gain = Disposal(
+        "GLD-1",
+        "GLD",
+        date(2024, 1, 2),
+        date(2026, 2, 16),
+        Shares("10"),
+        Money("2500.00"),
+        Money("2000.00"),
+        HoldingPeriod.LONG,
+        True,
+    )
+    assert blackout_tickers([gain], GOLD, on=date(2026, 3, 1)) == frozenset()

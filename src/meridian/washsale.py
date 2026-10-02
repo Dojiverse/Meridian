@@ -86,6 +86,7 @@ __all__ = [
     "WashSale",
     "WashSaleReport",
     "apply_basis_adjustment",
+    "blackout_tickers",
     "find_harvest_opportunities",
     "find_wash_sales",
     "wash_sale_window",
@@ -338,6 +339,24 @@ def find_wash_sales(
     processed in date order and replacement quantity is consumed as it
     is matched. Without that bookkeeping a single small repurchase would
     appear to disallow several different losses in full.
+
+    A LOT IS NOT ITS OWN REPLACEMENT. Shares bought on 20 November and
+    sold on 15 December were acquired inside the window, but they are
+    the shares being sold, not shares acquired to replace them. So the
+    purchase that created the disposed lot is netted out, up to the
+    quantity disposed, before anything is matched. Other shares bought
+    the same day — a larger purchase than the sale — can still be
+    replacements, which is why this is a quantity and not a flag.
+
+    SHARES SOLD IN THE SAME TRANSACTION ARE NOT REPLACEMENTS EITHER.
+    Rev. Rul. 56-602: a taxpayer who buys shares and then sells the
+    whole position, old and new, within the window has not replaced
+    anything — nothing is held afterwards for the loss to defer into.
+    So every disposal on a given day is netted against its own purchase
+    before any loss on that day is matched. Without this, selling an
+    old lot and a recent small lot together would wash the old lot's
+    loss against the recent lot's purchase, which the sale itself
+    disposed of.
     """
     findings: list[WashSale] = []
 
@@ -348,7 +367,25 @@ def find_wash_sales(
     }
     by_id = {a.acquisition_id: a for a in acquisitions}
 
-    for disposal in sorted(disposals, key=lambda d: (d.disposed, d.lot_id)):
+    ordered = sorted(disposals, key=lambda d: (d.disposed, d.lot_id))
+    netted_through: date | None = None
+
+    for disposal in ordered:
+        # Net every disposal on this day against the purchase that
+        # created it, before matching any of them. Shares sold today
+        # are gone; they replace nothing, loss or gain.
+        if netted_through != disposal.disposed:
+            for same_day in ordered:
+                if same_day.disposed == disposal.disposed:
+                    _consume_own_purchase(
+                        remaining,
+                        acquisitions,
+                        same_day.ticker,
+                        same_day.acquired,
+                        same_day.quantity.quantity,
+                    )
+            netted_through = disposal.disposed
+
         if not disposal.is_loss:
             # Section 1091 disallows LOSSES. A gain is taxable now
             # whatever you buy afterwards.
@@ -488,6 +525,9 @@ def would_trigger_wash_sale(
     sale_date: date,
     acquisitions: Sequence[Acquisition],
     substitutes: SubstituteMap,
+    *,
+    account_id: str | None = None,
+    selling: Sequence[tuple[date, Shares]] = (),
 ) -> tuple[Acquisition, ...]:
     """Which existing acquisitions would wash a loss sold on this date.
 
@@ -498,18 +538,91 @@ def would_trigger_wash_sale(
     Note this covers the 30 days AFTER the sale as well as before: a
     purchase already scheduled inside the forward window (a DRIP date, a
     recurring contribution) washes a sale that has not happened yet.
+
+    Args:
+        account_id: The account the sale is in.
+        selling: (acquired, quantity) for each lot being sold. The
+            purchase that created each of those lots — same account,
+            same ticker, same day — is netted out up to that quantity,
+            because the shares being sold are not replacements for
+            themselves. Any excess bought that day still counts, and an
+            acquisition that is only partly netted is returned with the
+            quantity that remains.
     """
     start, end = wash_sale_window(sale_date)
-    return tuple(
-        sorted(
-            (
-                a
-                for a in acquisitions
-                if start <= a.on <= end and substitutes.are_identical(ticker, a.ticker)
-            ),
-            key=lambda a: (a.on, a.acquisition_id),
+
+    remaining: dict[str, Decimal] = {
+        a.acquisition_id: a.quantity.quantity for a in acquisitions
+    }
+    if account_id is not None:
+        own = [a for a in acquisitions if a.account_id == account_id]
+        for acquired, quantity in selling:
+            _consume_own_purchase(remaining, own, ticker, acquired, quantity.quantity)
+
+    offenders = []
+    for a in sorted(acquisitions, key=lambda a: (a.on, a.acquisition_id)):
+        if not (start <= a.on <= end):
+            continue
+        if not substitutes.are_identical(ticker, a.ticker):
+            continue
+        left = remaining[a.acquisition_id]
+        if left <= 0:
+            continue
+        offenders.append(
+            a if left == a.quantity.quantity else replace(a, quantity=Shares(left))
         )
+    return tuple(offenders)
+
+
+def _consume_own_purchase(
+    remaining: dict[str, Decimal],
+    acquisitions: Sequence[Acquisition],
+    ticker: str,
+    acquired: date,
+    quantity: Decimal,
+) -> None:
+    """Net `quantity` of shares sold out of the purchase(s) that created
+    them: same ticker, acquired the same day. Oldest id first, so the
+    netting is reproducible when several purchases share a day."""
+    own = sorted(
+        (a for a in acquisitions if a.ticker == ticker and a.on == acquired),
+        key=lambda a: a.acquisition_id,
     )
+    for a in own:
+        if quantity <= 0:
+            break
+        take = min(quantity, remaining[a.acquisition_id])
+        remaining[a.acquisition_id] -= take
+        quantity -= take
+
+
+def blackout_tickers(
+    disposals: Sequence[Disposal],
+    substitutes: SubstituteMap,
+    *,
+    on: date,
+) -> frozenset[str]:
+    """Securities that must not be BOUGHT on `on`, because buying them
+    would wash a loss realised in the last 30 days.
+
+    The other half of section 1091. The pre-trade screen stops a sale
+    that an earlier purchase would wash; this stops a purchase that
+    would wash an earlier sale — the way a harvest is most often undone,
+    by the next rebalance quietly buying back what was just sold.
+
+    Returns the tickers sold at a loss within the window, plus every
+    ticker the firm's policy treats as identical to them. Gains impose
+    no blackout: section 1091 disallows losses only.
+    """
+    found: set[str] = set()
+    for d in disposals:
+        if not d.is_loss:
+            continue
+        if not (on - timedelta(days=WINDOW_DAYS) <= d.disposed <= on):
+            continue
+        found.add(d.ticker)
+        found.update(substitutes.identical.get(d.ticker, frozenset()))
+    return frozenset(found)
 
 
 # ============================================================
@@ -631,7 +744,12 @@ def find_harvest_opportunities(
                 period=period,
                 tax_benefit=benefit,
                 blocked_by=would_trigger_wash_sale(
-                    lot.ticker, on, acquisitions, substitutes
+                    lot.ticker,
+                    on,
+                    acquisitions,
+                    substitutes,
+                    account_id=account_id,
+                    selling=[(lot.acquired, lot.quantity)],
                 ),
                 alternatives=substitutes.alternatives_for(lot.ticker),
             )

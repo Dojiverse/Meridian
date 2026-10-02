@@ -55,6 +55,7 @@ from meridian.drift import DriftReport, SleeveDrift
 from meridian.money import Money, Price, Shares, Weight
 from meridian.rebalance import LotSelection, Proposal, Side, Trade, Unplaced
 from meridian.taxlot import HoldingPeriod
+from meridian.washsale import HarvestOpportunity
 
 # ============================================================
 # Serialisers
@@ -184,6 +185,7 @@ class TradeOut(Schema):
     sleeve: str
     reason: str
     blocked: bool = False
+    harvest: bool = False
 
     lots: tuple[LotSelectionOut, ...] = ()
     realized_gain: MoneyStr | None = None
@@ -205,6 +207,7 @@ class TradeOut(Schema):
             sleeve=trade.sleeve,
             reason=trade.reason,
             blocked=blocked,
+            harvest=trade.harvest,
             lots=tuple(LotSelectionOut.of(sel) for sel in trade.lots),
             realized_gain=gain,
             realized_gain_display="" if gain is None else str(gain),
@@ -274,6 +277,13 @@ class ProposalOut(Schema):
     cash_after_display: str
 
     is_clear: bool
+    """No blocks at all. Warnings may still be present."""
+    is_approvable: bool
+    """At least one trade survived the gate. A proposal can be approved
+    AS GATED — the blocked trades removed, the fundable survivors
+    executed — which is not an override of anything. Only a proposal
+    with nothing left to execute cannot be approved."""
+    trigger: str
     drift_before: DriftOut
 
     @classmethod
@@ -302,8 +312,59 @@ class ProposalOut(Schema):
             cash_after=proposal.cash_after,
             cash_after_display=str(proposal.cash_after),
             is_clear=compliance.is_clear,
+            is_approvable=bool(compliance.passed),
+            trigger=proposal.trigger,
             drift_before=DriftOut.of(account_id, proposal.drift_before),
         )
+
+
+# ============================================================
+# Harvest screen
+# ============================================================
+
+
+class HarvestOut(Schema):
+    """One lot at a loss, and whether the loss can be taken today."""
+
+    lot_id: str
+    ticker: str
+    acquired: date
+    quantity: SharesStr
+    market_value: MoneyStr
+    unrealized_loss: MoneyStr
+    unrealized_loss_display: str
+    period: HoldingPeriod
+    tax_benefit: MoneyStr
+    tax_benefit_display: str
+    is_blocked: bool
+    block_reason: str
+    alternatives: tuple[str, ...]
+
+    @classmethod
+    def of(cls, h: HarvestOpportunity) -> HarvestOut:
+        return cls(
+            lot_id=h.lot.lot_id,
+            ticker=h.lot.ticker,
+            acquired=h.lot.acquired,
+            quantity=h.lot.quantity,
+            market_value=h.market_value,
+            unrealized_loss=h.unrealized_loss,
+            unrealized_loss_display=str(h.unrealized_loss),
+            period=h.period,
+            tax_benefit=h.tax_benefit,
+            tax_benefit_display=str(h.tax_benefit),
+            is_blocked=h.is_blocked,
+            block_reason=h.block_reason,
+            alternatives=h.alternatives,
+        )
+
+
+class HarvestScreenOut(Schema):
+    account_id: str
+    opportunities: tuple[HarvestOut, ...]
+    blackout: tuple[str, ...]
+    """Tickers that may not be bought today because buying them would
+    wash a loss realised in the last 30 days."""
 
 
 # ============================================================

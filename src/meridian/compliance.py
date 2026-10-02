@@ -57,7 +57,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from enum import Enum
 from types import MappingProxyType
@@ -67,8 +67,13 @@ from meridian.household import AccountType
 from meridian.ledger import Portfolio
 from meridian.money import Money, Price, Weight
 from meridian.rebalance import Proposal, Side, Trade
-from meridian.taxlot import HoldingPeriod, TaxLot, holding_period
-from meridian.washsale import Acquisition, SubstituteMap, would_trigger_wash_sale
+from meridian.taxlot import Disposal, HoldingPeriod, TaxLot, holding_period
+from meridian.washsale import (
+    WINDOW_DAYS,
+    Acquisition,
+    SubstituteMap,
+    would_trigger_wash_sale,
+)
 
 __all__ = [
     "ComplianceContext",
@@ -142,7 +147,12 @@ class ComplianceContext:
     account_type: AccountType = AccountType.TAXABLE
     lots: Mapping[str, Sequence[TaxLot]] = NO_LOTS
     acquisitions: Sequence[Acquisition] = ()
+    """Every purchase across the HOUSEHOLD, for the sell-side screen."""
     substitutes: SubstituteMap | None = None
+    disposals: Sequence[Disposal] = ()
+    """Every realised sale across the household's TAXABLE accounts, for
+    the buy-side screen: a purchase today that would wash a loss taken
+    in the last 30 days."""
 
     def total_value(self) -> Money:
         return self.portfolio.total_value(self.prices)
@@ -346,14 +356,25 @@ class ShortTermGainLimit:
 
 @dataclass(frozen=True, slots=True)
 class WashSaleBlock:
-    """Block a sale that would have its loss disallowed.
+    """Both halves of section 1091, at the gate.
 
-    Runs the Phase 05 screen across the whole household. Severity
-    escalates: a loss that would be DEFERRED is a warning, because the
-    deduction comes back eventually. A loss that would be PERMANENTLY
-    FORFEITED — a replacement bought inside an IRA, Rev. Rul. 2008-5 —
-    is a block, because there is no version of that outcome the client
-    wanted.
+    SELLS. A sale at a loss that an existing purchase in the window
+    would wash. Severity escalates: a loss that would be DEFERRED is a
+    warning, because the deduction comes back eventually. A loss that
+    would be PERMANENTLY FORFEITED — a replacement bought inside an
+    IRA, Rev. Rul. 2008-5 — is a block, because there is no version of
+    that outcome the client wanted.
+
+    BUYS. A purchase that would wash a loss the household realised in
+    the last 30 days. Always a block: the most common way a harvest is
+    undone is the next rebalance quietly buying back what was just
+    sold, and nobody intends that. Inside an IRA the buy would forfeit
+    the loss outright, which is the same block with a worse citation.
+
+    Household scope in both directions. A Roth buying gold two weeks
+    after the taxable account harvested a gold loss is exactly the case
+    Rev. Rul. 2008-5 is about, and only a screen that sees both
+    accounts can catch it.
     """
 
     constraint_id: str
@@ -362,14 +383,63 @@ class WashSaleBlock:
     def check(self, context: ComplianceContext) -> tuple[Violation, ...]:
         if context.substitutes is None:
             return ()
+        return (*self._check_sells(context), *self._check_buys(context))
 
+    def _check_buys(self, context: ComplianceContext) -> tuple[Violation, ...]:
+        assert context.substitutes is not None
+        violations = []
+        for trade in context.proposal.buys:
+            washed = [
+                d
+                for d in context.disposals
+                if d.is_loss
+                and context.on - timedelta(days=WINDOW_DAYS) <= d.disposed <= context.on
+                and context.substitutes.are_identical(trade.ticker, d.ticker)
+            ]
+            if not washed:
+                continue
+            washed.sort(key=lambda d: (d.disposed, d.lot_id))
+            first = washed[0]
+            total = sum((d.gain for d in washed), Money.zero())
+            if context.account_type.forfeits_wash_sale_basis:
+                outcome = (
+                    "and because this is a retirement account the loss would be "
+                    "PERMANENTLY FORFEITED, not deferred"
+                )
+                authority = "Rev. Rul. 2008-5"
+            else:
+                outcome = "undoing the harvest; the loss would be deferred"
+                authority = self.authority
+            violations.append(
+                Violation(
+                    constraint_id=self.constraint_id,
+                    severity=Severity.BLOCK,
+                    subject=trade.ticker,
+                    message=(
+                        f"buying {trade.ticker} would wash the {abs(total)} loss "
+                        f"realised selling {first.ticker} on {first.disposed}, "
+                        f"{outcome}"
+                    ),
+                    authority=authority,
+                )
+            )
+        return tuple(violations)
+
+    def _check_sells(self, context: ComplianceContext) -> tuple[Violation, ...]:
+        assert context.substitutes is not None
         violations = []
         for trade in context.proposal.sells:
             if not _would_realise_loss(trade, context):
                 continue
 
             blockers = would_trigger_wash_sale(
-                trade.ticker, context.on, context.acquisitions, context.substitutes
+                trade.ticker,
+                context.on,
+                context.acquisitions,
+                context.substitutes,
+                account_id=context.account_id or None,
+                # The lots being sold are not their own replacements.
+                selling=[(sel.acquired, sel.quantity) for sel in trade.lots],
             )
             if not blockers:
                 continue
@@ -529,6 +599,10 @@ class ComplianceGate:
             blocked = list(context.proposal.trades)
             passed = []
 
+        passed, withdrawn, pair_violations = _withdraw_broken_pairs(passed, blocked)
+        blocked.extend(withdrawn)
+        violations.extend(pair_violations)
+
         passed, dropped, funding_violations = _ensure_fundable(passed, context)
         blocked.extend(dropped)
         violations.extend(funding_violations)
@@ -538,6 +612,42 @@ class ComplianceGate:
             blocked=tuple(blocked),
             violations=tuple(violations),
         )
+
+
+def _withdraw_broken_pairs(
+    passed: Sequence[Trade], blocked: Sequence[Trade]
+) -> tuple[list[Trade], list[Trade], list[Violation]]:
+    """If one leg of a paired decision is blocked, withdraw the other.
+
+    A harvest is a sell and a replacement buy, and it is only a harvest
+    if both happen. Block the buy alone and the client is out of the
+    market for a month on a position the firm meant to keep; block the
+    sell alone and the buy doubles up the exposure. Neither is what
+    anyone decided, so the surviving leg is withdrawn with its own
+    reason rather than executed on its own.
+    """
+    broken = {t.pair for t in blocked if t.pair}
+    kept: list[Trade] = []
+    withdrawn: list[Trade] = []
+    violations: list[Violation] = []
+    for trade in passed:
+        if trade.pair and trade.pair in broken:
+            withdrawn.append(trade)
+            violations.append(
+                Violation(
+                    constraint_id="harvest-pair",
+                    severity=Severity.BLOCK,
+                    subject=trade.ticker,
+                    message=(
+                        f"{trade.side.value} of {trade.ticker} withdrawn: the other "
+                        f"leg of harvest {trade.pair} was blocked, and a harvest is "
+                        "one decision with two legs"
+                    ),
+                )
+            )
+        else:
+            kept.append(trade)
+    return kept, withdrawn, violations
 
 
 def _ensure_fundable(

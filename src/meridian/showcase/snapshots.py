@@ -62,7 +62,7 @@ from meridian.performance import (
 )
 from meridian.rebalance import LotSelection, Trade, Unplaced
 from meridian.showcase.history import AccountHistory, History, Review, event_dates
-from meridian.taxlot import Disposal, LotMethod, TaxLot, dispose
+from meridian.taxlot import Disposal, TaxLot, replay_disposals
 from meridian.washsale import (
     HarvestOpportunity,
     WashSale,
@@ -191,6 +191,7 @@ def _trade(t: Trade, *, blocked: bool) -> JSON:
         "consideration_display": str(t.consideration),
         "reason": t.reason,
         "blocked": blocked,
+        "harvest": t.harvest,
         "lots": [_selection(s) for s in t.lots],
         "realized_gain": None if gain is None else _m(gain),
         "realized_gain_display": "" if gain is None else str(gain),
@@ -349,40 +350,6 @@ def _wash_sale(w: WashSale) -> JSON:
 # ============================================================
 # Derived series
 # ============================================================
-
-
-def _disposals_through(events: Sequence[LedgerEvent]) -> list[Disposal]:
-    """Every realised disposal, replaying sells exactly as build_lots
-    does — by the lots the Sell names, or FIFO when it names none."""
-    lots: dict[str, list[TaxLot]] = {}
-    found: list[Disposal] = []
-    for event in events:
-        if isinstance(event, Buy):
-            lots.setdefault(event.ticker, []).append(
-                TaxLot(
-                    lot_id=f"{event.ticker}-{event.seq}",
-                    ticker=event.ticker,
-                    acquired=event.on,
-                    quantity=event.quantity,
-                    cost_basis=event.consideration,
-                )
-            )
-        elif isinstance(event, Sell):
-            held = lots.get(event.ticker, [])
-            if event.lot_ids:
-                result = dispose(
-                    held,
-                    event.quantity,
-                    event.price,
-                    on=event.on,
-                    method=LotMethod.SPECIFIC_ID,
-                    chosen=event.lot_ids,
-                )
-            else:
-                result = dispose(held, event.quantity, event.price, on=event.on)
-            found.extend(result.disposals)
-            lots[event.ticker] = list(result.remaining_lots)
-    return found
 
 
 def _realized(disposals: Sequence[Disposal], year: int) -> JSON:
@@ -553,7 +520,7 @@ def _account_snapshot(
             }
         )
 
-    disposals = _disposals_through(events)
+    disposals = replay_disposals(events)
     taxable = not state.account.account_type.is_tax_advantaged
 
     harvest: list[JSON] = []
@@ -674,7 +641,21 @@ def _story(history: History) -> JSON:
         ),
         None,
     )
+    harvests = [
+        r for r in history.reviews if r.status == "approved" and r.proposal.harvests
+    ]
+    buy_blocks = [
+        r
+        for r in history.reviews
+        if any(
+            v.constraint_id == "wash-1091" and v.message.startswith("buying")
+            for v in r.compliance.blocks
+        )
+    ]
     return {
+        "first_harvest_review": harvests[0].review_id if harvests else None,
+        "harvest_reviews": len(harvests),
+        "buy_side_block_reviews": [r.review_id for r in buy_blocks],
         "first_blocked_review": first_block.review_id if first_block else None,
         "forfeiture_block_review": forfeit_block.review_id if forfeit_block else None,
         "clean_loss_sale_review": (

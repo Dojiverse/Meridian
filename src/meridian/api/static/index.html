@@ -258,8 +258,8 @@ function renderPositions(p) {
 
 function tradeRow(t) {
   return `<tr class="${t.blocked ? "struck" : ""}">
-    <td class="${t.side}">${t.side.toUpperCase()}</td>
-    <td><strong>${esc(t.ticker)}</strong></td>
+    <td class="${t.side}">${t.side.toUpperCase()}${t.harvest ? ' <span class="pill warn">harvest</span>' : ""}</td>
+    <td><strong>${esc(t.ticker)}</strong>${t.lots.length ? ` <span class="sub">${t.lots.length} lot${t.lots.length > 1 ? "s" : ""}</span>` : ""}</td>
     <td class="num">${esc(t.quantity)}</td>
     <td class="num">${esc(t.price)}</td>
     <td class="num">${esc(t.consideration_display)}</td>
@@ -307,11 +307,14 @@ function renderProposal(p) {
 
     <div class="row" style="margin-top:16px">
       <input id="actor" placeholder="your name" value="a.advisor">
-      <button id="approve" ${decided || !p.is_clear ? "disabled" : ""}>Approve</button>
+      <button id="approve" ${decided || !p.is_approvable ? "disabled" : ""}>
+        ${p.is_clear ? "Approve" : `Approve ${p.trades.length} as gated`}</button>
       <button id="reject" class="ghost" ${decided ? "disabled" : ""}>Reject</button>
-      ${!p.is_clear
-        ? '<span class="sub">Approval is disabled while blocking violations stand.</span>'
-        : ""}
+      ${!p.is_approvable && !decided
+        ? '<span class="sub">Nothing survived the compliance gate; there is nothing to approve.</span>'
+        : !p.is_clear && !decided
+          ? `<span class="sub">${p.blocked.length} blocked trade${p.blocked.length > 1 ? "s" : ""} will be removed, not overridden.</span>`
+          : ""}
     </div>`;
 
   if (!decided) {

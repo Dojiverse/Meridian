@@ -150,6 +150,11 @@ def build_prices(start: date, end: date) -> PriceBook:
             holding a loss — the thing the wash-sale screen exists for.
       IAU   GLD at a fifth of the price. The firm's policy treats the
             two as substantially identical.
+      SLV   silver: the firm's designated alternative to gold when a
+            gold loss is harvested. Its own walk, loosely similar in
+            shape — correlated, not identical.
+      SCHB  a broad-market fund at a fifth of VTI's price, the
+            designated alternative to VTI.
     """
     days = tuple(trading_days(start, end))
 
@@ -188,8 +193,29 @@ def build_prices(start: date, end: date) -> PriceBook:
         days,
     )
     iau = _scaled(gld, Decimal("0.2"))
+    slv = _walk(
+        "SLV",
+        28.0,
+        [
+            Regime(start, 0.05, 0.20),
+            Regime(date(2025, 5, 1), 0.45, 0.24),
+            Regime(date(2025, 11, 14), -0.80, 0.18),
+            Regime(date(2026, 1, 20), -0.30, 0.22),
+            Regime(date(2026, 4, 15), 0.04, 0.20),
+        ],
+        days,
+    )
+    schb = _scaled(vti, Decimal("0.2"))
 
     return PriceBook(
         days=days,
-        closes={"VTI": vti, "AAPL": aapl, "BND": bnd, "GLD": gld, "IAU": iau},
+        closes={
+            "VTI": vti,
+            "AAPL": aapl,
+            "BND": bnd,
+            "GLD": gld,
+            "IAU": iau,
+            "SLV": slv,
+            "SCHB": schb,
+        },
     )

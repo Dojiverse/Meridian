@@ -43,14 +43,23 @@ PRICES = {
     "BND": Price("50.00"),
     "GLD": Price("150.00"),
     "VEA": Price("52.00"),
+    "IAU": Price("30.00"),
+    "SLV": Price("27.00"),
+    "SCHB": Price("28.00"),
 }
 
+# The firm's harvest alternatives are classified into the sleeves they
+# replace. An unclassified replacement would be sold as untargeted at
+# the next review, quietly round-tripping the harvest into cash.
 CLASSIFICATION = {
     "VTI": "equity",
     "AAPL": "equity",
     "VEA": "equity",
+    "SCHB": "equity",
     "BND": "bond",
     "GLD": "alt",
+    "IAU": "alt",
+    "SLV": "alt",
 }
 
 CLASSIC = Model(
@@ -91,7 +100,12 @@ HIGH_BRACKET = TaxRates(
 # judgment call, recorded as data.
 SUBSTITUTES = SubstituteMap.symmetric(
     groups=[["GLD", "IAU"], ["VTI", "ITOT"]],
-    alternatives={"GLD": ("SLV",), "VTI": ("SCHB",)},
+    alternatives={
+        "GLD": ("SLV",),
+        "SLV": ("GLD",),
+        "VTI": ("SCHB",),
+        "SCHB": ("VTI",),
+    },
 )
 
 
@@ -131,7 +145,7 @@ def build_demo_store() -> Store:
                     constraint_id="ips-3.1",
                     limit=Weight("0.40"),
                     authority="IPS clause 3.1",
-                    exempt=frozenset({"VTI", "BND"}),
+                    exempt=frozenset({"VTI", "SCHB", "BND"}),
                 ),
                 MinimumCash(
                     constraint_id="ips-6",
