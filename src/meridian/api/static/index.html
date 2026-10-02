@@ -73,6 +73,15 @@
   .panel {
     background: var(--panel); border: 1px solid var(--rule);
     padding: 16px 18px;
+    /* Tables are wider than a phone. Let the panel scroll sideways
+       rather than the whole page. */
+    overflow-x: auto;
+  }
+  @media (max-width: 640px) {
+    main { padding: 16px; }
+    header { padding: 14px 16px; }
+    td, th { padding: 6px 6px; }
+    table { font-size: 13px; }
   }
   table { border-collapse: collapse; width: 100%; font-size: 14px; }
   th {
