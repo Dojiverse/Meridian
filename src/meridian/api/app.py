@@ -22,16 +22,34 @@ Generating a proposal, blocking a trade, approving, rejecting — each
 appends to the hash-chained log at the point the decision is made, on
 the server. A UI that wrote its own audit entries would be a UI that
 could forget to.
+
+============================================================
+ONE WORLD PER VISITOR
+============================================================
+
+The demo store is in memory. Served publicly with a single store, every
+visitor would see every other visitor's approvals, and the first person
+to click "approve" would decide the demo for everyone after them.
+
+So `create_app` accepts either a Store (one fixed world, which is what
+the tests want) or a factory that builds one. Given a factory, each
+browser gets its own world, identified by a cookie, built on first
+visit and dropped when it has been idle longest and the cap is reached.
+A visitor can also start over with POST /api/reset. Nothing about the
+engine changes; only who is looking at which copy of it.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import secrets
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from meridian.allocate import AllocationError
 from meridian.api.schemas import (
@@ -57,23 +75,91 @@ from meridian.washsale import blackout_tickers, find_harvest_opportunities
 
 STATIC = Path(__file__).parent / "static"
 
+SESSION_COOKIE = "meridian_demo"
+MAX_SESSIONS = 200
+"""How many visitor worlds to keep in memory before dropping the one
+idle longest. Each is a few kilobytes of events; two hundred is plenty
+for a portfolio page and bounded enough for a tiny container."""
 
-def create_app(store: Store) -> FastAPI:
-    """Build the app around a store.
+StoreFactory = Callable[[], Store]
 
-    The store is injected rather than global, so tests get a fresh world
-    per test instead of sharing state through import order — which is
-    the sort of coupling that produces a suite that passes alone and
-    fails in CI.
+
+def current_store(request: Request) -> Store:
+    """The world this request is looking at, placed by the middleware."""
+    world: Store = request.state.store
+    return world
+
+
+World = Annotated[Store, Depends(current_store)]
+"""Endpoint parameter type: the visitor's store. Module-level so FastAPI
+can resolve the annotation under `from __future__ import annotations`."""
+
+
+def create_app(store: Store | StoreFactory, *, root_path: str = "") -> FastAPI:
+    """Build the app around a store, or around a factory of stores.
+
+    Args:
+        store: A Store for one fixed world (tests do this, so each test
+            gets a fresh world injected rather than shared through
+            import order), or a zero-argument callable that builds a
+            Store, in which case every visitor gets their own.
+        root_path: Mount the whole app under this prefix, e.g. "/blotter",
+            for hosting behind a path-based rewrite. The page uses
+            relative URLs so it works at either place.
     """
+    fixed: Store | None = store if isinstance(store, Store) else None
+    factory: StoreFactory | None = None if fixed is not None else store  # type: ignore[assignment]
+    sessions: OrderedDict[str, Store] = OrderedDict()
+
     app = FastAPI(
         title="Meridian",
         version="0.1.0",
+        root_path=root_path,
         description=(
             "A tax-aware rebalancing engine. Every monetary value in "
             "this API is a JSON STRING — see meridian.api.schemas."
         ),
     )
+
+    # ---- which world is this request looking at? ----------------
+
+    def _new_session() -> tuple[str, Store]:
+        assert factory is not None
+        session_id = secrets.token_urlsafe(16)
+        sessions[session_id] = factory()
+        while len(sessions) > MAX_SESSIONS:
+            sessions.popitem(last=False)
+        return session_id, sessions[session_id]
+
+    @app.middleware("http")
+    async def _attach_store(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        if fixed is not None:
+            request.state.store = fixed
+            return await call_next(request)
+
+        session_id = request.cookies.get(SESSION_COOKIE)
+        is_new = session_id is None or session_id not in sessions
+        if is_new:
+            session_id, world = _new_session()
+        else:
+            assert session_id is not None
+            sessions.move_to_end(session_id)
+            world = sessions[session_id]
+        request.state.store = world
+        request.state.session_id = session_id
+
+        response = await call_next(request)
+        if is_new:
+            response.set_cookie(
+                SESSION_COOKIE,
+                session_id,
+                httponly=True,
+                samesite="lax",
+                max_age=60 * 60 * 24 * 30,
+            )
+        return response
 
     # ---- domain errors ------------------------------------------
     # The engine refuses things: a ledger that cannot be folded, an
@@ -101,7 +187,9 @@ def create_app(store: Store) -> FastAPI:
     def _now() -> datetime:
         return datetime.now(UTC)
 
-    def _audit(actor: str, action: Action, subject: str, **payload: str) -> None:
+    def _audit(
+        store: Store, actor: str, action: Action, subject: str, **payload: str
+    ) -> None:
         store.audit = store.audit.append(
             actor=actor,
             action=action,
@@ -116,10 +204,27 @@ def create_app(store: Store) -> FastAPI:
     def index() -> FileResponse:
         return FileResponse(STATIC / "index.html")
 
+    # ---- the visitor's world -----------------------------------
+
+    @app.post("/api/reset")
+    def reset(request: Request) -> dict[str, str]:
+        """Start this visitor over with a fresh demo world.
+
+        Only meaningful when each visitor has their own; with one fixed
+        store there is nothing per-visitor to reset.
+        """
+        if factory is None:
+            raise HTTPException(
+                status_code=409, detail="this instance serves one shared world"
+            )
+        session_id: str = request.state.session_id
+        sessions[session_id] = factory()
+        return {"status": "reset"}
+
     # ---- accounts ----------------------------------------------
 
     @app.get("/api/accounts")
-    def list_accounts() -> list[dict[str, str]]:
+    def list_accounts(store: World) -> list[dict[str, str]]:
         return [
             {
                 "account_id": state.account.account_id,
@@ -132,8 +237,8 @@ def create_app(store: Store) -> FastAPI:
         ]
 
     @app.get("/api/accounts/{account_id}/drift", response_model=DriftOut)
-    def account_drift(account_id: str) -> DriftOut:
-        state = _require_account(account_id)
+    def account_drift(account_id: str, store: World) -> DriftOut:
+        state = _require_account(store, account_id)
         portfolio = state.portfolio()
         values = group_values(
             market_values(portfolio, store.prices), state.classification
@@ -141,9 +246,9 @@ def create_app(store: Store) -> FastAPI:
         return DriftOut.of(account_id, compute_drift(values, state.model))
 
     @app.get("/api/accounts/{account_id}/positions")
-    def account_positions(account_id: str) -> dict[str, object]:
+    def account_positions(account_id: str, store: World) -> dict[str, object]:
         """Holdings with their lots. Money as strings, as everywhere."""
-        state = _require_account(account_id)
+        state = _require_account(store, account_id)
         portfolio = state.portfolio()
         lots = state.lots()
 
@@ -181,7 +286,7 @@ def create_app(store: Store) -> FastAPI:
     # ---- proposals ---------------------------------------------
 
     @app.post("/api/accounts/{account_id}/proposals", response_model=ProposalOut)
-    def create_proposal(account_id: str) -> ProposalOut:
+    def create_proposal(account_id: str, store: World) -> ProposalOut:
         """Generate a proposal and run it through the gate.
 
         Both in one call, and returned together. A UI that fetched
@@ -190,12 +295,12 @@ def create_app(store: Store) -> FastAPI:
         advisor who approves what is on screen has approved something
         the gate rejected.
         """
-        state = _require_account(account_id)
+        state = _require_account(store, account_id)
         portfolio = state.portfolio()
         lots = state.lots()
         acquisitions = store.household_acquisitions(account_id)
         disposals = store.household_disposals(account_id)
-        blackout = _blackout(state, disposals)
+        blackout = _blackout(store, state, disposals)
 
         # Lot-aware sells only where lots have a tax consequence. Inside
         # a Roth every lot costs the same to sell — nothing — so the
@@ -260,6 +365,7 @@ def create_app(store: Store) -> FastAPI:
         )
 
         _audit(
+            store,
             "rebalancer",
             Action.PROPOSAL_GENERATED,
             proposal_id,
@@ -271,6 +377,7 @@ def create_app(store: Store) -> FastAPI:
         for violation in compliance.violations:
             if violation.severity is Severity.BLOCK:
                 _audit(
+                    store,
                     "compliance-gate",
                     Action.CONSTRAINT_VIOLATED,
                     proposal_id,
@@ -285,12 +392,16 @@ def create_app(store: Store) -> FastAPI:
         return _render(store.proposals[proposal_id])
 
     @app.get("/api/proposals/{proposal_id}", response_model=ProposalOut)
-    def get_proposal(proposal_id: str) -> ProposalOut:
-        return _render(_require_proposal(proposal_id))
+    def get_proposal(proposal_id: str, store: World) -> ProposalOut:
+        return _render(_require_proposal(store, proposal_id))
 
     @app.post("/api/proposals/{proposal_id}/approve", response_model=ProposalOut)
-    def approve(proposal_id: str, request: ApproveRequest) -> ProposalOut:
-        stored = _require_proposal(proposal_id)
+    def approve(
+        proposal_id: str,
+        request: ApproveRequest,
+        store: World,
+    ) -> ProposalOut:
+        stored = _require_proposal(store, proposal_id)
 
         if stored.status != "pending":
             raise HTTPException(
@@ -325,6 +436,7 @@ def create_app(store: Store) -> FastAPI:
             note=request.note,
         )
         _audit(
+            store,
             request.actor,
             Action.PROPOSAL_APPROVED,
             proposal_id,
@@ -338,18 +450,48 @@ def create_app(store: Store) -> FastAPI:
         )
         return _render(store.proposals[proposal_id])
 
+    @app.post("/api/proposals/{proposal_id}/reject", response_model=ProposalOut)
+    def reject(
+        proposal_id: str,
+        request: RejectRequest,
+        store: World,
+    ) -> ProposalOut:
+        stored = _require_proposal(store, proposal_id)
+        if stored.status != "pending":
+            raise HTTPException(
+                status_code=409, detail=f"{proposal_id} is already {stored.status}"
+            )
+
+        store.proposals[proposal_id] = StoredProposal(
+            proposal_id=stored.proposal_id,
+            account_id=stored.account_id,
+            proposal=stored.proposal,
+            compliance=stored.compliance,
+            status="rejected",
+            decided_by=request.actor,
+            note=request.reason,
+        )
+        _audit(
+            store,
+            request.actor,
+            Action.PROPOSAL_REJECTED,
+            proposal_id,
+            reason=request.reason,
+        )
+        return _render(store.proposals[proposal_id])
+
     # ---- harvest --------------------------------------------------
 
     @app.get("/api/accounts/{account_id}/harvest", response_model=HarvestScreenOut)
-    def harvest_screen(account_id: str) -> HarvestScreenOut:
+    def harvest_screen(account_id: str, store: World) -> HarvestScreenOut:
         """Lots at a loss, which may be taken, and what may not be bought.
 
         The screen, not the trade. Generating a proposal is what acts
         on it; this is for seeing why a harvest was or was not proposed.
         """
-        state = _require_account(account_id)
+        state = _require_account(store, account_id)
         disposals = store.household_disposals(account_id)
-        blackout = _blackout(state, disposals)
+        blackout = _blackout(store, state, disposals)
 
         if (
             state.account.account_type.is_tax_advantaged
@@ -380,35 +522,10 @@ def create_app(store: Store) -> FastAPI:
             blackout=tuple(sorted(blackout)),
         )
 
-    @app.post("/api/proposals/{proposal_id}/reject", response_model=ProposalOut)
-    def reject(proposal_id: str, request: RejectRequest) -> ProposalOut:
-        stored = _require_proposal(proposal_id)
-        if stored.status != "pending":
-            raise HTTPException(
-                status_code=409, detail=f"{proposal_id} is already {stored.status}"
-            )
-
-        store.proposals[proposal_id] = StoredProposal(
-            proposal_id=stored.proposal_id,
-            account_id=stored.account_id,
-            proposal=stored.proposal,
-            compliance=stored.compliance,
-            status="rejected",
-            decided_by=request.actor,
-            note=request.reason,
-        )
-        _audit(
-            request.actor,
-            Action.PROPOSAL_REJECTED,
-            proposal_id,
-            reason=request.reason,
-        )
-        return _render(store.proposals[proposal_id])
-
     # ---- audit --------------------------------------------------
 
     @app.get("/api/audit", response_model=AuditOut)
-    def audit_log() -> AuditOut:
+    def audit_log(store: World) -> AuditOut:
         """The log, plus a live verification of its own chain.
 
         Verification runs on every read rather than on a schedule. A
@@ -436,7 +553,15 @@ def create_app(store: Store) -> FastAPI:
 
     # ---- helpers -------------------------------------------------
 
-    def _require_account(account_id: str) -> AccountState:
+    def _blackout(
+        store: Store, state: AccountState, disposals: Sequence[Disposal]
+    ) -> frozenset[str]:
+        """What may not be bought today — see washsale.blackout_tickers."""
+        if state.substitutes is None:
+            return frozenset()
+        return blackout_tickers(disposals, state.substitutes, on=store.today)
+
+    def _require_account(store: Store, account_id: str) -> AccountState:
         try:
             return store.account(account_id)
         except KeyError:
@@ -444,13 +569,7 @@ def create_app(store: Store) -> FastAPI:
                 status_code=404, detail=f"no account {account_id!r}"
             ) from None
 
-    def _blackout(state: AccountState, disposals: Sequence[Disposal]) -> frozenset[str]:
-        """What may not be bought today — see washsale.blackout_tickers."""
-        if state.substitutes is None:
-            return frozenset()
-        return blackout_tickers(disposals, state.substitutes, on=store.today)
-
-    def _require_proposal(proposal_id: str) -> StoredProposal:
+    def _require_proposal(store: Store, proposal_id: str) -> StoredProposal:
         stored = store.proposals.get(proposal_id)
         if stored is None:
             raise HTTPException(status_code=404, detail=f"no proposal {proposal_id!r}")
@@ -465,4 +584,21 @@ def create_app(store: Store) -> FastAPI:
             stored.status,
         )
 
-    return app
+    if not root_path:
+        return app
+
+    # ---- mounted under a prefix ----------------------------------
+    # Hosting rewrites a path such as /blotter/** to this service with
+    # the prefix intact, so the app has to answer there. Mounting keeps
+    # every route above unchanged; the page's relative URLs resolve
+    # against /blotter/ as long as the trailing slash is present, which
+    # the redirect guarantees.
+    outer = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    prefix = "/" + root_path.strip("/")
+
+    @outer.get(prefix, include_in_schema=False)
+    def _to_slash() -> RedirectResponse:
+        return RedirectResponse(prefix + "/", status_code=307)
+
+    outer.mount(prefix, app)
+    return outer

@@ -568,3 +568,68 @@ def test_a_blocked_harvest_is_not_proposed(client: TestClient) -> None:
 def test_the_roth_has_no_harvest_screen(client: TestClient) -> None:
     body = client.get("/api/accounts/roth-1/harvest").json()
     assert body["opportunities"] == []
+
+
+# ============================================================
+# ONE WORLD PER VISITOR
+# ============================================================
+
+
+def test_each_visitor_gets_their_own_world() -> None:
+    """Two browsers, two cookies, two stores. One visitor's approval is
+    invisible to the other, and the first to click does not decide the
+    demo for everyone after them."""
+    app = create_app(build_demo_store)
+    with TestClient(app) as alice, TestClient(app) as bob:
+        a = alice.post("/api/accounts/roth-1/proposals").json()
+        alice.post(
+            f"/api/proposals/{a['proposal_id']}/approve", json={"actor": "alice"}
+        )
+        assert alice.get("/api/audit").json()["entries"]
+        assert bob.get("/api/audit").json()["entries"] == []
+        assert bob.get(f"/api/proposals/{a['proposal_id']}").status_code == 404
+
+
+def test_the_session_cookie_is_set_once_and_reused() -> None:
+    app = create_app(build_demo_store)
+    with TestClient(app) as client:
+        first = client.get("/api/accounts")
+        assert "meridian_demo" in first.cookies
+        client.post("/api/accounts/roth-1/proposals")
+        again = client.get("/api/audit").json()
+        assert len(again["entries"]) == 1  # same world, state kept
+
+
+def test_reset_gives_the_visitor_a_fresh_world() -> None:
+    app = create_app(build_demo_store)
+    with TestClient(app) as client:
+        client.post("/api/accounts/roth-1/proposals")
+        assert client.get("/api/audit").json()["entries"]
+        assert client.post("/api/reset").status_code == 200
+        assert client.get("/api/audit").json()["entries"] == []
+
+
+def test_reset_is_refused_on_a_single_shared_world(client: TestClient) -> None:
+    assert client.post("/api/reset").status_code == 409
+
+
+def test_the_app_can_be_mounted_under_a_prefix() -> None:
+    """Hosting rewrites /blotter/** to the service with the prefix
+    intact. The page uses relative URLs, so it only needs the trailing
+    slash, which the redirect guarantees."""
+    app = create_app(build_demo_store, root_path="/blotter")
+    with TestClient(app) as client:
+        bare = client.get("/blotter", follow_redirects=False)
+        assert bare.status_code == 307
+        assert bare.headers["location"].endswith("/blotter/")
+        assert client.get("/blotter/").status_code == 200
+        assert client.get("/blotter/api/accounts").status_code == 200
+        assert client.get("/api/accounts").status_code == 404
+
+
+def test_the_page_uses_relative_urls() -> None:
+    from meridian.api.app import STATIC
+
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    assert "fetch(url(path)" in page
+    assert "fetch('/api" not in page and 'fetch("/api' not in page

@@ -1,0 +1,13 @@
+.venv
+.git
+.github
+.devcontainer
+.hypothesis
+.mypy_cache
+.ruff_cache
+.pytest_cache
+**/__pycache__
+*.egg-info
+tests
+showcase
+WALKTHROUGH.md

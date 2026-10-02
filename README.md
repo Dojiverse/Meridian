@@ -1,7 +1,28 @@
 # Meridian
 
+[![CI](https://github.com/Dojiverse/Meridian/actions/workflows/ci.yml/badge.svg)](https://github.com/Dojiverse/Meridian/actions/workflows/ci.yml)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Dojiverse/Meridian?quickstart=1)
+
 A tax-aware rebalancing, tax-lot, and performance engine for a registered
 investment adviser.
+
+## Try it
+
+You do not need to install anything to see what it does.
+
+- **The story, with the engine's own output:** [pedropetcov.com/meridian](https://pedropetcov.com/meridian).
+  Two years of a household run through the engine. Drag the slider to any
+  day, flip the lot method, break the audit log in your browser.
+- **The live blotter:** [pedropetcov.com/blotter](https://pedropetcov.com/blotter/).
+  The adviser's screen. Generate a proposal, watch the compliance gate
+  block a wash sale, approve what survived. You get your own copy of the
+  demo world; nobody else sees your clicks.
+- **Run it yourself:** the Codespaces badge above opens the repository in
+  a browser-based editor with the blotter already running. Or locally:
+
+  ```bash
+  pip install -e ".[api]" && python -m meridian.api   # http://127.0.0.1:8000
+  ```
 
 It answers the questions an adviser's trading desk asks every month: how
 far has this account drifted from its model, which trades bring it back,
@@ -61,7 +82,8 @@ in-memory store.
 
 ## Setup
 
-Requires Python 3.12+.
+Requires Python 3.12+. A `Dockerfile` is included for hosting the
+blotter; it is what runs the public demo.
 
 ```bash
 python -m venv .venv

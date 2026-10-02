@@ -125,7 +125,7 @@
 
 <header>
   <h1>Meridian</h1>
-  <span class="sub">tax-aware rebalancing &middot; every amount on the wire is a string</span>
+  <span class="sub">tax-aware rebalancing &middot; every amount on the wire is a string &middot; demo data, your own copy</span>
 </header>
 
 <main>
@@ -133,6 +133,7 @@
     <div class="row">
       <select id="account"></select>
       <button id="propose">Generate proposal</button>
+      <button id="reset" class="ghost" title="Start over with a fresh demo world">Reset demo</button>
       <span id="status" class="sub"></span>
     </div>
   </section>
@@ -170,9 +171,13 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"]/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-async function get(path)        { return (await fetch(path)).json(); }
+// URLs are RELATIVE so the page works at / locally and under a prefix
+// such as /blotter/ when hosted behind a path rewrite. The server
+// redirects /blotter to /blotter/ so relative resolution is stable.
+const url = (path) => path.replace(/^\//, "");
+async function get(path)        { return (await fetch(url(path))).json(); }
 async function post(path, body) {
-  const r = await fetch(path, {
+  const r = await fetch(url(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {}),
@@ -384,6 +389,17 @@ $("propose").onclick = async () => {
     renderProposal(await post(`/api/accounts/${currentAccount}/proposals`));
     $("status").textContent = "";
     await refreshAudit();
+  } catch (e) {
+    $("status").textContent = e.message;
+  }
+};
+
+$("reset").onclick = async () => {
+  // Each visitor has their own world; this throws it away and builds a
+  // new one. Nothing anyone else is looking at changes.
+  try {
+    await post("/api/reset");
+    location.reload();
   } catch (e) {
     $("status").textContent = e.message;
   }
